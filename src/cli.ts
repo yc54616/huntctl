@@ -524,10 +524,19 @@ async function watchNativeWorkers(runId: string): Promise<void> {
   }
 }
 
+const paneSnapshotCounts = new Map<string, number>();
+
 function appendPaneSnapshot(label: string, output: string, separated: boolean): void {
-  const time = new Date().toLocaleTimeString("ko-KR", { hour12: false });
-  const divider = `\n── ${label} ${time} ──\n`;
-  process.stdout.write(`${separated ? divider : ""}${output.trimEnd()}\n`);
+  const count = (paneSnapshotCounts.get(label) ?? 0) + 1;
+  paneSnapshotCounts.set(label, count);
+  const divider = `\n── ${label} #${count} 갱신 ${clockTime()} ──\n`;
+  void separated;
+  process.stdout.write(`${divider}${output.trimEnd()}\n`);
+}
+
+function clockTime(date = new Date()): string {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
 function isPidAlive(pid?: number): boolean {

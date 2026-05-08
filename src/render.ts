@@ -54,12 +54,14 @@ export async function renderNativeStatus(runDir: string, dockerMessage?: string)
   const completedTasks = Object.values(state.tasks).filter((task) => task.status === "done").length;
   const focus = runbook.profile === "bug-bounty" ? bugBountyFocus(runbook) : ctfFocus(runbook);
   const header = `${strong("요약")} ${profileKo(state.profile)} ${statusBadge(state.status)}`;
+  const timing = `경과 ${elapsedMinutes(state.createdAt)} / 시작 ${clockTime(state.createdAt)} / 상태 갱신 ${clockTime(state.updatedAt)}`;
 
   return [
     header,
     rule(width),
     section("지금"),
     kv("대상", focus, width),
+    kv("시간", timing, width),
     kv("진행", `${coordinator.alive ? "자동 진행 중" : "자동 루프 멈춤"} / 실행 ${runningTasks} / 대기 ${queuedTasks} / 완료 ${completedTasks}`, width),
     kv("환경", `${state.sandboxMode} full-access / ${image}`, width),
     kv("토큰", formatTokenUsage(tokens), width),
@@ -648,6 +650,29 @@ function profileKo(profile: string): string {
     "bug-bounty": "버그바운티"
   };
   return map[profile] ?? profile;
+}
+
+function clockTime(iso?: string): string {
+  if (!iso) return "-";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "-";
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function elapsedMinutes(iso?: string): string {
+  if (!iso) return "-";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "-";
+  const totalMinutes = Math.max(0, Math.floor((Date.now() - date.getTime()) / 60000));
+  const days = Math.floor(totalMinutes / 1440);
+  const hours = Math.floor((totalMinutes % 1440) / 60);
+  const minutes = totalMinutes % 60;
+  const parts: string[] = [];
+  if (days) parts.push(`${days}일`);
+  if (hours) parts.push(`${hours}시간`);
+  parts.push(`${minutes}분`);
+  return parts.join(" ");
 }
 
 function workerRoleKo(role: string): string {
