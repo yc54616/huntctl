@@ -61,6 +61,7 @@ challenge:
 
   it("maps direct investigation workers to xhigh reasoning by default", () => {
     assert.equal(reasoningEffortForAgent({ id: "advisor", role: "advisor" }), "low");
+    assert.equal(reasoningEffortForAgent({ id: "worker-1", role: "worker" }), "xhigh");
     assert.equal(reasoningEffortForAgent({ id: "recon-1", role: "recon" }), "xhigh");
     assert.equal(reasoningEffortForAgent({ id: "solver-1", role: "solver" }), "xhigh");
     assert.equal(reasoningEffortForAgent({ id: "validator-1", role: "validator" }), "xhigh");
@@ -192,7 +193,7 @@ agents:
       });
       await assignWorkerTask({
         runDir,
-        agentId: "file-triage-1",
+        agentId: "worker-1",
         prompt: "analyze local challenge files",
         source: "user"
       });
@@ -205,7 +206,7 @@ agents:
       }
 
       assert.equal(state.status, "running");
-      assert.equal(state.agents["file-triage-1"].status, "done");
+      assert.equal(state.agents["worker-1"].status, "done");
     } finally {
       if (previous === undefined) {
         delete process.env.HUNTCTL_FAKE_CODEX;
@@ -237,6 +238,30 @@ agents:
     assert.equal((await readState(runDirFor(runId, dir))).workspace, state.workspace);
   });
 
+  it("stages bug bounty mobile artifacts into the target workspace", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "huntctl-mobile-artifact-"));
+    const apk = path.join(dir, "target.apk");
+    await writeFile(apk, "fake apk", "utf8");
+
+    const { runDir } = await startInteractiveSession({
+      profile: "bug-bounty",
+      workers: 1,
+      sandboxMode: "host",
+      workspace: dir,
+      targetName: "Mobile Example",
+      scope: ["https://api.example.com"],
+      files: [apk]
+    });
+
+    const state = await readState(runDir);
+    const runbook = await loadRunbook(path.join(runDir, "runbook.yml"));
+    const staged = runbook.target?.files[0];
+    assert.equal(Boolean(staged), true);
+    assert.equal(staged?.startsWith(path.join(state.workspace, "input-files")), true);
+    assert.equal(staged?.endsWith("target.apk"), true);
+    assert.equal(await pathExists(staged ?? ""), true);
+  });
+
   it("auto-assigns idle interactive bug bounty workers when advisor returns no tasks", async () => {
     const previous = process.env.HUNTCTL_FAKE_CODEX;
     process.env.HUNTCTL_FAKE_CODEX = "1";
@@ -257,7 +282,8 @@ agents:
       const state = await readState(runDir);
       const advisorTasks = Object.values(state.tasks).filter((task) => task.source === "advisor");
       assert.equal(advisorTasks.length > 0, true);
-      assert.equal(advisorTasks.some((task) => task.agentId === "recon-1" || task.agentId === "validator-2"), true);
+      assert.equal(advisorTasks.some((task) => task.agentId === "worker-1" || task.agentId === "worker-2"), true);
+      assert.equal(advisorTasks.some((task) => task.prompt.includes('이번 target focus는 "https://app.example.com"')), true);
       assert.equal(advisorTasks.some((task) => task.prompt.includes("이번 작업 lane")), true);
       assert.equal(advisorTasks.some((task) => task.prompt.includes("관련 VRT/weakness")), true);
       assert.equal(
@@ -269,6 +295,104 @@ agents:
       assert.equal(advisorTasks.some((task) => task.prompt.includes("candidate ledger")), true);
       assert.equal(advisorTasks.some((task) => task.prompt.includes("Decision: report-ready | keep | blocked | reject | pivot-adjacent | rotate-lane")), true);
       assert.equal(state.status, "running");
+    } finally {
+      if (previous === undefined) {
+        delete process.env.HUNTCTL_FAKE_CODEX;
+      } else {
+        process.env.HUNTCTL_FAKE_CODEX = previous;
+      }
+    }
+  });
+
+  it("spreads multiple web scope targets across idle workers", async () => {
+    const previous = process.env.HUNTCTL_FAKE_CODEX;
+    process.env.HUNTCTL_FAKE_CODEX = "1";
+    try {
+      const dir = await mkdtemp(path.join(os.tmpdir(), "huntctl-target-spread-"));
+      const { runDir } = await startInteractiveSession({
+        profile: "bug-bounty",
+        workers: 3,
+        sandboxMode: "host",
+        workspace: dir,
+        scope: ["https://one.example.com", "https://two.example.com", "https://three.example.com"],
+        description: "authorized test program"
+      });
+
+      await runAdvisorLoop({ runDir, once: true });
+
+      const state = await readState(runDir);
+      const advisorTasks = Object.values(state.tasks).filter((task) => task.source === "advisor");
+      assert.equal(advisorTasks.some((task) => task.agentId === "worker-1" && task.prompt.includes('이번 target focus는 "https://one.example.com"')), true);
+      assert.equal(advisorTasks.some((task) => task.agentId === "worker-2" && task.prompt.includes('이번 target focus는 "https://two.example.com"')), true);
+      assert.equal(advisorTasks.some((task) => task.agentId === "worker-3" && task.prompt.includes('이번 target focus는 "https://three.example.com"')), true);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.HUNTCTL_FAKE_CODEX;
+      } else {
+        process.env.HUNTCTL_FAKE_CODEX = previous;
+      }
+    }
+  });
+
+  it("respects worker counts above three for automatic assignment", async () => {
+    const previous = process.env.HUNTCTL_FAKE_CODEX;
+    process.env.HUNTCTL_FAKE_CODEX = "1";
+    try {
+      const dir = await mkdtemp(path.join(os.tmpdir(), "huntctl-five-workers-"));
+      const { runDir } = await startInteractiveSession({
+        profile: "bug-bounty",
+        workers: 5,
+        sandboxMode: "host",
+        workspace: dir,
+        scope: [
+          "https://one.example.com",
+          "https://two.example.com",
+          "https://three.example.com",
+          "https://four.example.com",
+          "https://five.example.com"
+        ],
+        description: "authorized test program"
+      });
+
+      await runAdvisorLoop({ runDir, once: true });
+
+      const state = await readState(runDir);
+      const advisorTasks = Object.values(state.tasks).filter((task) => task.source === "advisor");
+      assert.equal(advisorTasks.length, 5);
+      assert.equal(advisorTasks.some((task) => task.agentId === "worker-5" && task.prompt.includes('이번 target focus는 "https://five.example.com"')), true);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.HUNTCTL_FAKE_CODEX;
+      } else {
+        process.env.HUNTCTL_FAKE_CODEX = previous;
+      }
+    }
+  });
+
+  it("does not send every worker to the mobile lane when an APK exists", async () => {
+    const previous = process.env.HUNTCTL_FAKE_CODEX;
+    process.env.HUNTCTL_FAKE_CODEX = "1";
+    try {
+      const dir = await mkdtemp(path.join(os.tmpdir(), "huntctl-mobile-spread-"));
+      const apk = path.join(dir, "app.apk");
+      await writeFile(apk, "fake apk", "utf8");
+      const { runDir } = await startInteractiveSession({
+        profile: "bug-bounty",
+        workers: 3,
+        sandboxMode: "host",
+        workspace: dir,
+        scope: ["https://one.example.com", "https://two.example.com", "https://three.example.com"],
+        files: [apk],
+        description: "authorized test program"
+      });
+
+      await runAdvisorLoop({ runDir, once: true });
+
+      const state = await readState(runDir);
+      const advisorTasks = Object.values(state.tasks).filter((task) => task.source === "advisor");
+      const mobileTasks = advisorTasks.filter((task) => task.prompt.includes('이번 작업 lane은 "mobile/app-link/API client surface"'));
+      assert.equal(mobileTasks.length, 1);
+      assert.equal(advisorTasks.some((task) => task.prompt.includes('이번 target focus는 "https://two.example.com"')), true);
     } finally {
       if (previous === undefined) {
         delete process.env.HUNTCTL_FAKE_CODEX;
@@ -489,6 +613,8 @@ describe("prompt caching layout", () => {
     assert.match(bountyPrompt, /SSRF/i);
     assert.match(bountyPrompt, /Decision: report-ready \| keep \| blocked \| reject \| pivot-adjacent \| rotate-lane/i);
     assert.match(bountyPrompt, /blocked.*user-provided authorization/i);
+    assert.match(bountyPrompt, /advisor review/i);
+    assert.match(bountyPrompt, /request for advisor review/i);
   });
 
   it("keeps report templates out of recon prompts", async () => {
@@ -523,6 +649,7 @@ describe("prompt caching layout", () => {
       agents: [
         { id: "advisor", role: "advisor" },
         { id: "recon-1", role: "recon" },
+        { id: "worker-1", role: "worker" },
         { id: "report-writer-1", role: "report-writer" }
       ],
       evidence_dir: ".huntctl/evidence",
@@ -543,11 +670,74 @@ describe("prompt caching layout", () => {
       taskPrompt: "prepare report draft",
       runbookPath: path.join(dir, "runbook.yml")
     });
+    const workerReconPrompt = await buildWorkerPrompt({
+      runbook,
+      agent: { id: "worker-1", role: "worker" },
+      taskPrompt: "check https://asset-0.example.com for candidate evidence",
+      runbookPath: path.join(dir, "runbook.yml")
+    });
+    const workerReportPrompt = await buildWorkerPrompt({
+      runbook,
+      agent: { id: "worker-1", role: "worker" },
+      taskPrompt: "prepare platform report draft after advisor review",
+      runbookPath: path.join(dir, "runbook.yml")
+    });
 
     assert.equal(reconPrompt.includes("UNIQUE_REPORT_TEMPLATE_SENTINEL"), false);
+    assert.equal(workerReconPrompt.includes("UNIQUE_REPORT_TEMPLATE_SENTINEL"), false);
     assert.match(reconPrompt, /report-template\.md/);
     assert.match(reconPrompt, /\.\.\. \+30 more in runbook/);
     assert.match(reportPrompt, /UNIQUE_REPORT_TEMPLATE_SENTINEL/);
+    assert.match(workerReportPrompt, /UNIQUE_REPORT_TEMPLATE_SENTINEL/);
+  });
+
+  it("includes Android mobile artifact workflow in bug bounty prompts", async () => {
+    const runbook: Runbook = {
+      profile: "bug-bounty",
+      target: {
+        name: "mobile example",
+        scope: ["https://api.example.com"],
+        out_of_scope: [],
+        files: ["/workspace/input-files/app.apk"]
+      },
+      program: {
+        description: "authorized",
+        platform: "custom",
+        vrt: [],
+        weaknesses: [],
+        rules: {}
+      },
+      advisor: {
+        mode: "manual",
+        interval_seconds: 45,
+        can_assign_workers: true,
+        can_stop_workers: true
+      },
+      limits: {
+        max_parallel_agents: 2,
+        timeout_minutes: 45
+      },
+      agents: [
+        { id: "advisor", role: "advisor" },
+        { id: "recon-1", role: "recon" }
+      ],
+      evidence_dir: ".huntctl/evidence",
+      sandbox: {
+        mode: "host"
+      }
+    };
+
+    const prompt = await buildWorkerPrompt({
+      runbook,
+      agent: { id: "recon-1", role: "recon" },
+      taskPrompt: buildInitialTaskPrompt(runbook, { id: "recon-1", role: "recon" })
+    });
+
+    assert.match(prompt, /mobile_artifacts/);
+    assert.match(prompt, /app\.apk/);
+    assert.match(prompt, /apktool\/jadx\/aapt/);
+    assert.match(prompt, /android-emulator-headless/);
+    assert.match(prompt, /adb install/);
   });
 
   it("includes compact VRT coverage context in recon prompts", async () => {

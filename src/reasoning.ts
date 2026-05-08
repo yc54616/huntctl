@@ -20,6 +20,7 @@ function isDirectInvestigationRole(role: string): boolean {
     "endpoint",
     "mapper",
     "triage",
+    "worker",
     "solver",
     "validator",
     "web",

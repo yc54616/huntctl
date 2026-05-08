@@ -816,6 +816,7 @@ function elapsedShort(iso?: string): string {
 
 function workerRoleKo(role: string): string {
   const map: Record<string, string> = {
+    worker: "worker",
     recon: "정찰 worker",
     validator: "검증 worker",
     "report-writer": "리포트 worker",

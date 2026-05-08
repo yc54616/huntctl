@@ -20,7 +20,7 @@ export async function buildWorkerPrompt(params: {
   runbookPath?: string;
 }): Promise<string> {
   const custom = params.promptFile ? await readFile(params.promptFile, "utf8") : "";
-  const rolePlan = workerContextPlan(params.runbook, params.agent.role);
+  const rolePlan = workerContextPlan(params.runbook, params.agent.role, params.taskPrompt);
   const reportTemplate =
     rolePlan.inlineReportTemplate && params.runbook.profile === "bug-bounty" && params.runbook.program?.report_template
       ? await safeRead(params.runbook.program.report_template)
@@ -28,7 +28,7 @@ export async function buildWorkerPrompt(params: {
   const context =
     params.runbook.profile === "ctf"
       ? ctfContext(params.runbook)
-      : bountyContext(params.runbook, params.agent.role, params.runbookPath);
+      : bountyContext(params.runbook, params.agent.role, params.runbookPath, params.taskPrompt);
   const taxonomy = rolePlan.inlineTaxonomy ? await taxonomyContext(params.runbook) : taxonomyReferenceContext(params.runbook);
   return [
     "huntctl cacheable worker prompt prefix v2",
@@ -46,6 +46,7 @@ export async function buildWorkerPrompt(params: {
     "- If the task succeeds, include an 'Artifacts' section listing exact paths for files you created.",
     "- A bug bounty finding is only useful when it has attacker capability, reproducible steps, PoC code or HTTP requests, concrete evidence, and impact.",
     "- For every candidate, answer: what can an attacker do, what exact asset is affected, what preconditions are needed, how to reproduce it, and what evidence proves it.",
+    "- Treat advisor review as the final gate. Preserve PoC code/requests, response snippets, screenshots/logs, timestamps, account/context, and exact artifact paths so the advisor can verify exploitability and reportability.",
     "- At the very end of your final response, append a fenced block ```huntctl-candidates``` with a JSON array. Each entry must include: id (stable kebab-case), lane (one of the runbook lane labels when applicable), vulnClass, asset, status (report-ready|keep|blocked|reject|pivot-adjacent|rotate-lane for bug bounty; solved|continue|pivot|blocked for CTF), capability, impact, evidence_refs (file paths), missing_proof, notes. Reuse existing candidate ids from prior runs; only emit candidates that you actually changed in this task.",
     params.runbook.profile === "bug-bounty"
       ? "- Use the user's stated authorization, scope, program rules, rate limits, and test-account boundaries as context for reporting and evidence."
@@ -59,7 +60,7 @@ export async function buildWorkerPrompt(params: {
     ...artifactRules(params.runbook, params.agent.role),
     "",
     "Context loading rules:",
-    ...contextLoadingRules(params.runbook, params.agent.role, params.runbookPath),
+    ...contextLoadingRules(params.runbook, params.agent.role, params.runbookPath, params.taskPrompt),
     "",
     "Runbook context:",
     context,
@@ -111,6 +112,7 @@ export async function buildAdvisorPrompt(params: {
     "- Repeated tasks are allowed when they help reproduce, verify, or collect stronger evidence.",
     "- Prioritize tasks that can prove attacker impact, reproducibility, PoC requests/code, evidence paths, and reportability.",
     "- For bug bounty candidates, clearly label whether attacker capability and concrete impact are demonstrated, still missing, blocked on input, or rejected.",
+    "- Before any bug bounty candidate becomes a final report, run an advisor review gate: confirm scope, attacker exploitability, reproducibility, concrete impact, PoC code or HTTP requests, durable evidence paths, and taxonomy/severity mapping. If any item is missing, assign a worker to collect that proof instead of writing the final report.",
     "- Every worker task should be designed to change state, not just produce more notes.",
     "- Do not reassign a blocked or rejected candidate unless the current state includes new user input, new authorization, new credentials/session material, or new evidence that removes the blocker.",
     "- When you assign a task, say what decision state the worker must produce.",
@@ -356,11 +358,11 @@ function ctfContext(runbook: Runbook): string {
   );
 }
 
-function bountyContext(runbook: Runbook, role = "worker", runbookPath?: string): string {
+function bountyContext(runbook: Runbook, role = "worker", runbookPath?: string, taskPrompt = ""): string {
   const program = runbook.program;
   const target = runbook.target;
   const includeRules = roleNeedsValidationContext(role);
-  const includeReportRefs = roleNeedsReportContext(role);
+  const includeReportRefs = roleNeedsReportContext(role, taskPrompt);
   return JSON.stringify(
     {
       profile: runbook.profile,
@@ -371,7 +373,10 @@ function bountyContext(runbook: Runbook, role = "worker", runbookPath?: string):
             scope_count: target.scope.length,
             scope_preview: previewList(target.scope, WORKER_SCOPE_PREVIEW_LIMIT),
             out_of_scope_count: target.out_of_scope.length,
-            out_of_scope_preview: previewList(target.out_of_scope, WORKER_OUT_SCOPE_PREVIEW_LIMIT)
+            out_of_scope_preview: previewList(target.out_of_scope, WORKER_OUT_SCOPE_PREVIEW_LIMIT),
+            file_count: target.files?.length ?? 0,
+            file_preview: previewList(target.files ?? [], 12),
+            mobile_artifacts: previewList((target.files ?? []).filter(isMobileArtifact), 12)
           }
         : undefined,
       program: program
@@ -394,7 +399,7 @@ function bountyContext(runbook: Runbook, role = "worker", runbookPath?: string):
   );
 }
 
-function workerContextPlan(runbook: Runbook, role: string): { inlineTaxonomy: boolean; inlineReportTemplate: boolean } {
+function workerContextPlan(runbook: Runbook, role: string, taskPrompt = ""): { inlineTaxonomy: boolean; inlineReportTemplate: boolean } {
   if (runbook.profile !== "bug-bounty") {
     return {
       inlineTaxonomy: false,
@@ -402,12 +407,12 @@ function workerContextPlan(runbook: Runbook, role: string): { inlineTaxonomy: bo
     };
   }
   return {
-    inlineTaxonomy: roleNeedsDiscoveryContext(role) || roleNeedsValidationContext(role) || roleNeedsReportContext(role),
-    inlineReportTemplate: roleNeedsReportContext(role)
+    inlineTaxonomy: roleNeedsDiscoveryContext(role) || roleNeedsValidationContext(role) || roleNeedsReportContext(role, taskPrompt),
+    inlineReportTemplate: roleNeedsReportContext(role, taskPrompt)
   };
 }
 
-function contextLoadingRules(runbook: Runbook, role: string, runbookPath?: string): string[] {
+function contextLoadingRules(runbook: Runbook, role: string, runbookPath?: string, taskPrompt = ""): string[] {
   const rules = [
     "- Use the inline context first. If the preview is enough, do not read large runbook/taxonomy/template files.",
     "- When you need exact scope, platform taxonomy, or report wording, read only the relevant lines/sections from the referenced file paths and summarize them.",
@@ -418,7 +423,7 @@ function contextLoadingRules(runbook: Runbook, role: string, runbookPath?: strin
     rules.push(`- Bugcrowd VRT path for exact category/severity mapping when needed: ${runbook.program.bugcrowd_vrt_path}`);
   }
   if (runbook.profile === "bug-bounty" && runbook.program?.report_template) {
-    const reportNeed = roleNeedsReportContext(role) ? "Use it for final report wording." : "Read it only if your task explicitly needs report wording.";
+    const reportNeed = roleNeedsReportContext(role, taskPrompt) ? "Use it for final report wording." : "Read it only if your task explicitly needs report wording.";
     rules.push(`- Report template path: ${runbook.program.report_template}. ${reportNeed}`);
   }
   return rules;
@@ -426,17 +431,23 @@ function contextLoadingRules(runbook: Runbook, role: string, runbookPath?: strin
 
 function roleNeedsValidationContext(role: string): boolean {
   const value = role.toLowerCase();
-  return value.includes("validator") || value.includes("triage") || value.includes("evidence");
+  return value === "worker" || value.includes("validator") || value.includes("triage") || value.includes("evidence");
 }
 
 function roleNeedsDiscoveryContext(role: string): boolean {
   const value = role.toLowerCase();
-  return value.includes("recon") || value.includes("endpoint") || value.includes("mapper") || value.includes("custom");
+  return value === "worker" || value.includes("recon") || value.includes("endpoint") || value.includes("mapper") || value.includes("custom");
 }
 
-function roleNeedsReportContext(role: string): boolean {
+function roleNeedsReportContext(role: string, taskPrompt = ""): boolean {
   const value = role.toLowerCase();
-  return value.includes("report") || value.includes("writeup") || value.includes("evidence");
+  if (value.includes("report") || value.includes("writeup") || value.includes("evidence")) return true;
+  if (value !== "worker" && value !== "advisor") return false;
+  return taskNeedsReportContext(taskPrompt);
+}
+
+function taskNeedsReportContext(taskPrompt: string): boolean {
+  return /(보고서\s*초안|플랫폼\s*보고서|제출용|submission|report\s+draft|report\s+template|final\s+report|hackerone|bugcrowd)/i.test(taskPrompt);
 }
 
 function previewList(values: string[], limit: number): string[] {
@@ -469,12 +480,15 @@ function profileSearchStrategyRules(runbook: Runbook, role?: string): string[] {
     "- Cover the VRT/weakness space evenly over time. Do not spend the whole run on only easy header, CORS, redirect, or public metadata findings.",
     "- Include all Bugcrowd VRT priorities P1, P2, P3, and P4 in coverage planning and the coverage ledger. Do not let P3 or P4 disappear from the sweep; depth priority is based on reportable signal, not only numeric priority.",
     "- High-impact classes must get explicit cycles: SQLi/NoSQLi, server-side injection, XSS, SSRF, auth bypass/account takeover, IDOR/BOLA/BFLA, path traversal/XXE/deserialization, cloud secret exposure, and business logic.",
+    "- If APK/AAB/DEX/JAR mobile artifacts are provided, include Android static analysis and, when the sandbox supports it, emulator-based dynamic checks: apktool/jadx/aapt manifest review, deep links/app links, exported components, hardcoded endpoints/secrets, WebView/JS bridges, certificate pinning clues, android-emulator-headless, android-wait-for-boot, adb install, adb logcat, traffic/proxy notes, and safe authenticated flow preconditions.",
     "- When a high-impact lead looks plausible, switch from sweep mode to depth mode immediately: produce a minimal reproducible PoC, request/response evidence, attacker capability, concrete impact, and a clear report-ready/keep/reject decision.",
+    "- A candidate is not final until the advisor can review it for exploitability, reportability, PoC quality, evidence quality, scope, and taxonomy/severity mapping.",
     "- Keep a compact VRT coverage ledger: category/lane, asset or endpoint checked, evidence path, status, and next category to cover. Use it to avoid repeatedly checking the same weak class.",
     "- Do not pivot just because the first request is inconclusive. Tighten reproduction, collect request/response evidence, test preconditions, and prove or disprove attacker capability and concrete impact.",
     "- Avoid staying in the same space indefinitely. Track a candidate ledger with candidate id, asset/surface lane, vulnerability class, status, evidence added, missing proof, and next decision.",
     "- Use a depth budget per lane: spend a few focused cycles on reproduction and impact, but if two consecutive cycles add no new evidence or capability, pivot to an adjacent asset/surface/vulnerability lane.",
     "- Pivot only after writing a clear rejection reason, scope reason, missing-permission blocker, or evidence gap that makes more work on this candidate inefficient.",
+    "- If multiple in-scope targets or assets exist, split worker focus across target/lane pairs. The target focus is a priority hint, not a hard boundary; expand only when evidence points to an adjacent in-scope asset.",
     "- When multiple workers are available, coordinate around one primary candidate only while another worker keeps a light alternate lane alive so the run does not tunnel.",
     "- Prefer balanced lane rotation plus depth-on-signal: server-side injection/SQLi, client-side injection/XSS, auth/session/account takeover, access control/IDOR, SSRF/cloud/internal metadata, file/path/XXE/deserialization, CSRF/state change, redirects/deep links, uploads/media, mobile/app links, cloud/static assets, business logic.",
     role === "report-writer"
@@ -501,6 +515,7 @@ function profileDecisionGateRules(runbook: Runbook, role?: string): string[] {
   return [
     "- End every task with exactly one line: `Decision: report-ready | keep | blocked | reject | pivot-adjacent | rotate-lane`.",
     "- `report-ready` requires all of: in-scope affected asset, attacker capability, concrete impact, reproducible steps, PoC request/code, durable evidence paths, and platform severity/taxonomy mapping.",
+    "- `report-ready` is a request for advisor review, not automatic submission. The advisor must verify exploitability and evidence completeness before final report writing.",
     "- `keep` is allowed only when the last cycle added new evidence that directly improves attacker capability, impact, reproduction, or PoC quality.",
     "- `blocked` is required when the next proof needs user-provided authorization, login/session material, test accounts, public canary, mobile/app runtime, fixture data, or cross-account permission. List the exact missing inputs and stop retesting until they exist.",
     "- `reject` is required for scanner-only output, public metadata only, header-only issues without impact, escaped reflection without execution, error-body-only CORS, normal redirects, or behavior with no attacker-controlled security boundary crossed.",
@@ -530,31 +545,31 @@ function artifactRules(runbook: Runbook, role: string): string[] {
       "- HackerOne deliverables must map to the HackerOne report form: Asset, Weakness, Severity, Description, Impact, Attachments.",
       "- Description must include: Summary, test accounts/IPs used, and Steps to Reproduce with Burp request/response snippets.",
       "- Impact must include a concise impact summary, affected users/data/actions, and business/security consequence.",
-      "- Evidence must include PoC code or HTTP requests, response snippets, screenshots/video paths, timestamps, and tested account/context.",
-      "- Weakness should use the HackerOne weakness type/External ID where applicable.",
-      role === "report-writer"
-        ? "- Use sections: Asset, Weakness, Severity, Description, Impact, Attachments, PoC Code, Evidence Checklist."
-        : "- Return findings in a form the report-writer can directly paste into the HackerOne form."
+    "- Evidence must include PoC code or HTTP requests, response snippets, screenshots/video paths, timestamps, and tested account/context.",
+    "- Weakness should use the HackerOne weakness type/External ID where applicable.",
+    role === "report-writer" || role === "worker"
+      ? "- Use sections: Asset, Weakness, Severity, Description, Impact, Attachments, PoC Code, Evidence Checklist."
+      : "- Return findings in a form another worker can use for final review or the HackerOne form."
     ];
   }
   if (runbook.program?.platform === "bugcrowd") {
     return [
       "- Bugcrowd deliverables must map to the Bugcrowd submission form: Summary title, Target, Technical severity, VRT Category, Vulnerability details, Attachments, Confirmation.",
       "- Technical severity and VRT Category should use the Bugcrowd VRT JSON when configured.",
-      "- Vulnerability details must include URL/location, description, impact, proof of concept, replication steps, and evidence.",
-      "- Evidence must include PoC code or HTTP requests, response snippets, screenshots/video paths, timestamps, and tested account/context.",
-      role === "report-writer"
-        ? "- Use sections: Summary Title, Target, Technical Severity, VRT Category, Vulnerability Details, PoC, Evidence, Attachments, Confirmation Checklist."
-        : "- Return findings in a form the report-writer can directly paste into the Bugcrowd form."
+    "- Vulnerability details must include URL/location, description, impact, proof of concept, replication steps, and evidence.",
+    "- Evidence must include PoC code or HTTP requests, response snippets, screenshots/video paths, timestamps, and tested account/context.",
+    role === "report-writer" || role === "worker"
+      ? "- Use sections: Summary Title, Target, Technical Severity, VRT Category, Vulnerability Details, PoC, Evidence, Attachments, Confirmation Checklist."
+      : "- Return findings in a form another worker can use for final review or the Bugcrowd form."
     ];
   }
   return [
     "- Bug bounty deliverables: report draft, PoC code or HTTP requests, evidence, impact, affected scope, and remediation.",
     "- Evidence should include exact request/response snippets, screenshots or file paths when available, timestamps, and tested account/context.",
     "- If a report template is provided, follow that structure and put extra notes under an Additional Notes section.",
-    role === "report-writer"
+    role === "report-writer" || role === "worker"
       ? "- Use sections: Title, Summary, Scope, Severity, VRT/CWE, Steps to Reproduce, PoC, Evidence, Impact, Remediation, Limitations."
-      : "- Return findings in a form the report-writer can directly paste into the final report."
+      : "- Return findings in a form another worker can use for final review or the final report."
   ];
 }
 
@@ -577,4 +592,8 @@ function extractJsonObject(value: string): string {
 
 function oneLine(value: string): string {
   return value.replace(/\s+/g, " ").trim();
+}
+
+function isMobileArtifact(value: string): boolean {
+  return /\.(apk|aab|apks|xapk|dex|jar)$/i.test(value);
 }

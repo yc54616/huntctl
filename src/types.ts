@@ -37,6 +37,7 @@ export interface TargetConfig {
   name: string;
   scope: string[];
   out_of_scope: string[];
+  files?: string[];
 }
 
 export interface ProgramConfig {

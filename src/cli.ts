@@ -55,7 +55,7 @@ program
   .option("--description <text>", "target/challenge description")
   .option("--scope <url>", "in-scope URL, repeatable", collect, [])
   .option("--out-of-scope <url>", "out-of-scope URL, repeatable", collect, [])
-  .option("--file <path>", "CTF challenge file, repeatable", collect, [])
+  .option("--file <path>", "input file/artifact, repeatable; CTF files or bug bounty APK/AAB/DEX/JAR/mobile artifacts", collect, [])
   .option("--evidence-dir <path>", "host directory for shared evidence/artifacts; defaults to <target-dir>/evidence")
   .option("--vrt <name>", "VRT category, repeatable", collect, [])
   .option("--weakness <name>", "weakness/CWE/OWASP item, repeatable", collect, [])

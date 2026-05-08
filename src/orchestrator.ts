@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { loadRunbook, resolvePromptFile, runbookToYaml } from "./runbook.js";
 import { createInteractiveRunbook } from "./runbook.js";
@@ -27,6 +27,7 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const DEFAULT_ADVISOR_DEBOUNCE_MS = 30_000;
 const DEFAULT_COORDINATOR_POLL_MS = 5_000;
+const WORKER_REAPER_GRACE_MS = 30_000;
 
 export async function startRun(params: {
   runbookPath: string;
@@ -105,9 +106,11 @@ export async function startInteractiveSession(params: {
     targetName: params.targetName,
     targetDir: params.targetDir
   });
+  const inputFiles = await stageInputFiles(sessionWorkspace, params.files ?? []);
   const evidenceDir = params.evidenceDir ?? "evidence";
   const runbook = createInteractiveRunbook({
     ...params,
+    files: inputFiles,
     evidenceDir
   });
   const { runId, runDir } = await createRunStore({
@@ -145,6 +148,16 @@ export async function startInteractiveSession(params: {
     source: "orchestrator",
     message: readySummary
   });
+  if (inputFiles.length) {
+    await appendEvent(runDir, {
+      time: nowIso(),
+      runId,
+      type: "input.files",
+      source: "orchestrator",
+      message: `staged ${inputFiles.length} input file(s)`,
+      data: { files: inputFiles }
+    });
+  }
   return { runId, runDir };
 }
 
@@ -161,6 +174,33 @@ async function prepareInteractiveWorkspace(params: {
   await mkdir(path.join(workspace, "evidence"), { recursive: true });
   await mkdir(path.join(workspace, "notes"), { recursive: true });
   return workspace;
+}
+
+async function stageInputFiles(workspace: string, files: string[]): Promise<string[]> {
+  const staged: string[] = [];
+  if (!files.length) return staged;
+  const inputDir = path.join(workspace, "input-files");
+  await mkdir(inputDir, { recursive: true });
+  for (const item of files) {
+    const source = path.resolve(item);
+    if (!(await pathExists(source))) {
+      throw new Error(`Input file not found: ${source}`);
+    }
+    const target = await uniqueInputTarget(inputDir, path.basename(source));
+    await cp(source, target, { recursive: true });
+    staged.push(target);
+  }
+  return staged;
+}
+
+async function uniqueInputTarget(inputDir: string, name: string): Promise<string> {
+  const parsed = path.parse(name || "input");
+  for (let index = 0; index < 1000; index += 1) {
+    const suffix = index === 0 ? "" : `-${index}`;
+    const candidate = path.join(inputDir, `${safeDockerName(parsed.name || "input")}${suffix}${parsed.ext}`);
+    if (!(await pathExists(candidate))) return candidate;
+  }
+  return path.join(inputDir, `${safeDockerName(parsed.name || "input")}-${Date.now()}${parsed.ext}`);
 }
 
 function defaultTargetFolderName(profile: Runbook["profile"], targetName?: string): string {
@@ -614,7 +654,8 @@ async function runAdvisorOnce(runDir: string, runbook: Runbook): Promise<void> {
 
   if (decision && runbook.advisor.can_assign_workers) {
     let assignmentState = await readState(runDir);
-    for (const nextTask of decision.next_tasks.slice(0, 3)) {
+    const assignmentLimit = Math.max(1, runbook.limits.max_parallel_agents);
+    for (const nextTask of decision.next_tasks.slice(0, assignmentLimit)) {
       const agent = pickAgentForTask(runbook.agents, assignmentState, nextTask.worker_id, nextTask.worker_role);
       if (!agent || !nextTask.task) {
         await updateState(runDir, (next) => {
@@ -796,11 +837,16 @@ async function buildAutomaticPlannerDecision(runbook: Runbook, state: RunState):
 
 function buildBugBountyPlannerDecision(runbook: Runbook, state: RunState, workers: AgentConfig[]): AdvisorDecision {
   const scopeCount = runbook.target?.scope.length ?? 0;
+  let mobileAssigned = hasCoveredMobileLane(runbook, state);
   const nextTasks = collectSafeFallbackTasks(
     runbook,
     state,
     workers.slice(0, Math.max(1, runbook.limits.max_parallel_agents)),
-    (worker) => bountyFallbackTask(runbook, state, worker)
+    (worker) => {
+      const task = bountyFallbackTask(runbook, state, worker, { preferMobile: !mobileAssigned });
+      if (extractLaneFromPrompt(task.task) && isMobileLaneLabel(extractLaneFromPrompt(task.task) ?? "")) mobileAssigned = true;
+      return task;
+    }
   );
   const message = nextTasks.length
     ? `idle worker ${nextTasks.length}개에 다음 작업을 자동 배정합니다. 현재 scope ${scopeCount}개 기준으로 candidate를 검증하고, 결과는 report-ready/keep/blocked/reject/pivot-adjacent/rotate-lane 중 하나로 닫습니다.`
@@ -837,35 +883,50 @@ function collectSafeFallbackTasks(
   runbook: Runbook,
   state: RunState,
   workers: AgentConfig[],
-  build: (worker: AgentConfig) => AdvisorDecision["next_tasks"][number]
+  build: (worker: AgentConfig, index: number) => AdvisorDecision["next_tasks"][number]
 ): AdvisorDecision["next_tasks"] {
   const tasks: AdvisorDecision["next_tasks"] = [];
-  for (const worker of workers) {
-    const task = build(worker);
+  for (const [index, worker] of workers.entries()) {
+    const task = build(worker, index);
     if (!task.task.trim()) continue;
     if (!evaluateTaskPolicy(runbook, task.task).allowed) continue;
     tasks.push(task);
   }
-  return tasks.slice(0, 3);
+  return tasks;
 }
 
-function bountyFallbackTask(runbook: Runbook, state: RunState, worker: AgentConfig): AdvisorDecision["next_tasks"][number] {
+function bountyFallbackTask(
+  runbook: Runbook,
+  state: RunState,
+  worker: AgentConfig,
+  options: { preferMobile?: boolean } = {}
+): AdvisorDecision["next_tasks"][number] {
   const round = (state.agents[worker.id]?.taskCount ?? 0) + 1;
   const platform = runbook.program?.platform ?? "custom";
   const evidence = runbook.evidence_dir;
-  const lanePlan = selectBountyLanePlan(runbook, state, worker, round);
+  const lanePlan = selectBountyLanePlan(runbook, state, worker, round, options);
   const promising = selectPromisingCandidate(state);
   const shouldDeepen = Boolean(promising && roleShouldDeepenCandidate(worker.role));
   const focusCandidate = shouldDeepen ? promising : undefined;
+  const mobileArtifacts = bountyMobileArtifacts(runbook);
+  const targetFocus = selectBountyTargetFocus(runbook, worker, round);
   const mode = focusCandidate
     ? `이번 작업은 VRT 균등 sweep보다 주력 candidate 심화가 우선입니다. candidate=${focusCandidate.id}, status=${focusCandidate.status}, lane=${focusCandidate.lane ?? "unknown"}, class=${focusCandidate.vulnClass ?? "unknown"}. `
     : "이번 작업은 VRT/weakness lane을 골고루 커버하는 sweep입니다. 이미 본 쉬운 header/CORS/static 후보만 반복하지 말고 아직 덜 본 P1/P2/P3/P4 category와 class를 확인하세요. ";
   const vrt = lanePlan.lane.vrt?.length ? `관련 VRT/weakness: ${lanePlan.lane.vrt.join(", ")}. ` : "";
+  const targetContext = targetFocus
+    ? `이번 target focus는 "${targetFocus}"입니다. 이 focus를 우선 보되, 증거상 필요하면 인접 in-scope asset으로 확장하세요. `
+    : "";
+  const mobileContext = mobileArtifacts.length
+    ? `제공된 mobile artifact: ${mobileArtifacts.join(", ")}. APK/AAB/DEX/JAR는 정적 분석 후, 가능하면 Docker sandbox에서 android-emulator-headless, android-wait-for-boot, adb install, adb logcat, deep link 실행, 프록시/트래픽 증거 수집까지 시도하세요. 에뮬레이터/KVM/런타임이 불가능하면 blocked로 정확한 런타임 요구사항을 남기세요. `
+    : "";
   const base =
     `자동 라운드 ${round}. 현재 runbook 목표 정보와 기존 ${evidence} 산출물을 기준으로 진행하세요. ` +
     `이번 작업 lane은 "${lanePlan.lane.label}"입니다. 인접 전환 lane은 "${lanePlan.next.label}"입니다. ` +
+    targetContext +
     mode +
     vrt +
+    mobileContext +
     `lane 목표: ${lanePlan.lane.goal} ` +
     "P1/P2/P3/P4 VRT priority를 모두 coverage ledger에 포함하되, SQLi/NoSQLi, server-side injection, XSS, SSRF, auth bypass, IDOR/BOLA, file/path traversal, deserialization, cloud secret exposure, account takeover 계열은 낮은 비용의 재현 가능한 PoC로 우선 확인하세요. " +
     "단순 header, 공개 metadata, scanner-only 결과는 report-ready 후보가 아니며, 같은 쉬운 표면을 반복하지 마세요. " +
@@ -882,6 +943,17 @@ function bountyFallbackTask(runbook: Runbook, state: RunState, worker: AgentConf
     "결과에는 `Why continue`와 `Why stop/rotate`를 모두 포함하고, reportable 여부, 불확실성, 다음 배정 후보를 한국어로 남기세요.";
 
   const role = worker.role;
+  if (role === "worker") {
+    const focus = focusCandidate
+      ? `${lanePlan.lane.validator} advisor 최종 검토를 준비하세요. 이 candidate가 보고 가능한 공격자 악용 취약점인지 scope, attacker capability, concrete impact, 재현성, PoC code/request, durable evidence path, taxonomy/severity 기준으로 검증하고 report-ready/keep/blocked/reject/pivot-adjacent/rotate-lane 중 하나로 판정하세요. report-ready이면 플랫폼 보고서 초안과 PoC/evidence checklist까지 작성하되, advisor가 최종 승인할 수 있게 누락 증거도 명확히 표시하세요.`
+      : `${lanePlan.lane.recon} target focus에서 이 lane의 가장 좋은 candidate 1개와 대체 candidate 1개를 고르고, 가능하면 낮은 요청 수로 capability/impact/repro 신호까지 확인하세요.`;
+    return {
+      worker_id: worker.id,
+      worker_role: role,
+      task: `${focus} ${base}`,
+      reason: "idle worker가 있어 target/lane 단위로 조사하고 advisor 검토용 결과를 생성"
+    };
+  }
   if (role === "recon" || role === "endpoint-mapper") {
     const focus = [
       `${lanePlan.lane.recon} 기존 evidence에서 확인 가능한 host/endpoint 후보를 중복 제거하고, 이 lane에서 가장 좋은 candidate 1개와 대체 candidate 1개만 고르세요.`,
@@ -1021,11 +1093,11 @@ const DEFAULT_BOUNTY_LANES: BountyLane[] = [
   },
   {
     label: "mobile/app-link/API client surface",
-    goal: "모바일 앱/API client metadata에서 hidden endpoint, weak link, token/storage impact를 확인",
+    goal: "모바일 앱/APK/API client metadata와 런타임 동작에서 hidden endpoint, weak link, token/storage impact를 확인",
     vrt: ["Mobile Security Misconfiguration", "Insecure Data Storage", "Insecure Data Transport", "Broken Authentication and Session Management"],
-    recon: "APK/manifest/deep link/API host/certificate pinning hints/client config를 중심으로 보세요.",
-    validator: "앱 링크/토큰/hidden endpoint가 실제 서버 side impact로 이어지는지 확인하고 단순 노출이면 제외하세요.",
-    report: "앱 버전, manifest/API evidence, 서버 재현 요청, 영향 가능성과 한계를 정리하세요."
+    recon: "APK/AAB/DEX/JAR가 있으면 apktool, jadx, aapt/apksigner로 manifest, exported components, permissions, deep links/app links, WebView/JS bridge, hardcoded endpoints/secrets, certificate pinning clues를 먼저 보세요.",
+    validator: "에뮬레이터가 가능하면 android-emulator-headless, android-wait-for-boot, adb install, logcat, deep link 실행, safe traffic capture/proxy evidence로 앱 링크/토큰/hidden endpoint가 서버 side impact로 이어지는지 확인하고 단순 노출이면 제외하세요.",
+    report: "앱 파일/버전/hash, manifest/API evidence, emulator/logcat/traffic evidence, 서버 재현 요청, 영향 가능성과 한계를 정리하세요."
   },
   {
     label: "business-logic/state transition",
@@ -1049,9 +1121,18 @@ function selectBountyLanePlan(
   runbook: Runbook,
   state: RunState,
   worker: AgentConfig,
-  round: number
+  round: number,
+  options: { preferMobile?: boolean } = {}
 ): { lane: BountyLane; next: BountyLane } {
   const lanes = runbook.bounty_lanes && runbook.bounty_lanes.length ? runbook.bounty_lanes : DEFAULT_BOUNTY_LANES;
+  const mobileLane = bountyMobileArtifacts(runbook).length ? lanes.find(isMobileLane) : undefined;
+  if (options.preferMobile && mobileLane && !hasCoveredLane(state, mobileLane.label) && roleCanStartMobileCoverage(worker.role)) {
+    const index = lanes.indexOf(mobileLane);
+    return {
+      lane: mobileLane,
+      next: lanes[(index + 1) % lanes.length]
+    };
+  }
   const promising = selectPromisingCandidate(state);
   const candidateLane = promising && roleShouldDeepenCandidate(worker.role) ? laneForCandidate(lanes, promising) : undefined;
   if (candidateLane) {
@@ -1061,7 +1142,7 @@ function selectBountyLanePlan(
       next: lanes[(index + 1) % lanes.length]
     };
   }
-  const roleOffset = roleLaneOffset(worker.role);
+  const roleOffset = roleLaneOffset(worker.role, worker.id);
   const laneStats = bountyLaneStats(state);
   const scored = lanes
     .map((lane, index) => {
@@ -1080,6 +1161,49 @@ function selectBountyLanePlan(
     lane: lanes[index],
     next: lanes[(index + 1) % lanes.length]
   };
+}
+
+function bountyMobileArtifacts(runbook: Runbook): string[] {
+  return (runbook.target?.files ?? []).filter((file) => /\.(apk|aab|apks|xapk|dex|jar)$/i.test(file));
+}
+
+function selectBountyTargetFocus(runbook: Runbook, worker: AgentConfig, round: number): string | undefined {
+  const scope = runbook.target?.scope.filter((entry) => entry.trim()) ?? [];
+  if (!scope.length) return undefined;
+  const index = (workerOrdinal(worker.id) + Math.max(0, round - 1)) % scope.length;
+  return scope[index];
+}
+
+function workerOrdinal(workerId: string): number {
+  const suffix = workerId.match(/-(\d+)$/)?.[1];
+  if (suffix) return Math.max(0, Number(suffix) - 1);
+  let hash = 0;
+  for (const char of workerId) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+  return hash;
+}
+
+function isMobileLane(lane: BountyLane): boolean {
+  return /mobile|android|app-link|api client/i.test(lane.label);
+}
+
+function hasCoveredMobileLane(runbook: Runbook, state: RunState): boolean {
+  if (!bountyMobileArtifacts(runbook).length) return true;
+  return Object.values(state.tasks).some((task) => {
+    const lane = extractTaskLane(task);
+    return lane ? isMobileLaneLabel(lane) : false;
+  });
+}
+
+function extractLaneFromPrompt(prompt: string): string | undefined {
+  return prompt.match(/이번 작업 lane은\s+"([^"]+)"/)?.[1];
+}
+
+function isMobileLaneLabel(label: string): boolean {
+  return /mobile|android|app-link|api client/i.test(label);
+}
+
+function hasCoveredLane(state: RunState, laneLabel: string): boolean {
+  return Object.values(state.tasks).some((task) => task.source === "advisor" && extractTaskLane(task) === laneLabel);
 }
 
 function selectPromisingCandidate(state: RunState): Candidate | undefined {
@@ -1102,7 +1226,12 @@ function candidateStatusPriority(candidate: Candidate): number {
 
 function roleShouldDeepenCandidate(role: string): boolean {
   const value = role.toLowerCase();
-  return value.includes("validator") || value.includes("report") || value.includes("evidence") || value.includes("custom");
+  return value === "worker" || value.includes("validator") || value.includes("report") || value.includes("evidence") || value.includes("custom");
+}
+
+function roleCanStartMobileCoverage(role: string): boolean {
+  const value = role.toLowerCase();
+  return value === "worker" || value.includes("recon") || value.includes("endpoint") || value.includes("validator") || value.includes("mobile") || value.includes("android") || value.includes("custom");
 }
 
 function laneForCandidate(lanes: BountyLane[], candidate: Candidate): BountyLane | undefined {
@@ -1163,8 +1292,9 @@ function isHighImpactLane(lane: BountyLane): boolean {
   );
 }
 
-function roleLaneOffset(role: string): number {
+function roleLaneOffset(role: string, workerId: string): number {
   const value = role.toLowerCase();
+  if (value === "worker") return workerOrdinal(workerId);
   if (value.includes("endpoint")) return 1;
   if (value.includes("validator")) return 2;
   if (value.includes("evidence")) return 3;
@@ -1184,6 +1314,20 @@ function ctfFallbackTask(runbook: Runbook, state: RunState, worker: AgentConfig)
     "명령, 분석 결과, 실패한 가설, pivot 여부, 다음 시도를 한국어로 남기고 flag를 찾으면 Flag, Exploit Code, Writeup, Reproduction으로 정리하세요.";
 
   const role = worker.role;
+  if (role === "worker") {
+    const focus = [
+      "문제 artifact/서비스에서 가장 빠른 풀이 가설 하나를 정하고 1회 깊게 시도하세요.",
+      "이전 시도와 다른 풀이 축으로 전환해 새 신호를 찾으세요.",
+      "작은 PoC 또는 solver script로 flag 가능성을 빠르게 판정하세요.",
+      "최근 결과 중 가장 가능성 있는 PoC/solver를 재현해 flag 여부를 검증하세요."
+    ][(workerOrdinal(worker.id) + round) % 4];
+    return {
+      worker_id: worker.id,
+      worker_role: role,
+      task: `${focus} ${base}`,
+      reason: "idle worker가 있어 CTF 풀이 축을 분산해 flag 우선으로 진행"
+    };
+  }
   if (role === "file-triage" || role === "web-recon") {
     const focus = [
       "문제 artifact inventory를 짧게 갱신하고 가장 빠른 풀이 가설 2개와 포기 기준을 정하세요.",
@@ -1437,11 +1581,84 @@ async function emitAdvisorHeartbeat(runDir: string): Promise<void> {
 
 async function reapDeadWorkers(runDir: string): Promise<void> {
   const state = await readState(runDir);
+  const events = await readEvents(runDir, 300);
+  const now = Date.now();
   const stale: Array<{ taskId: string; agentId: string; pid?: number }> = [];
+  const recovered: Array<{
+    taskId: string;
+    agentId: string;
+    finalMessage: string;
+    artifactDir: string;
+    candidateUpdates: ReturnType<typeof parseCandidateUpdates>;
+  }> = [];
   for (const task of Object.values(state.tasks)) {
     if (task.status !== "running" && task.status !== "starting") continue;
     if (task.pid && isPidAlive(task.pid)) continue;
+    const recovery = await recoverCompletedDeadWorker(runDir, task);
+    if (recovery) {
+      recovered.push({
+        taskId: task.id,
+        agentId: task.agentId,
+        finalMessage: recovery.finalMessage,
+        artifactDir: recovery.artifactDir,
+        candidateUpdates: parseCandidateUpdates(recovery.finalMessage)
+      });
+      continue;
+    }
+    if (hasRecentTaskActivity(task.id, events, now, WORKER_REAPER_GRACE_MS)) continue;
     stale.push({ taskId: task.id, agentId: task.agentId, pid: task.pid });
+  }
+  if (recovered.length) {
+    await updateState(runDir, (next) => {
+      for (const entry of recovered) {
+        const task = next.tasks[entry.taskId];
+        if (task && (task.status === "running" || task.status === "starting")) {
+          task.status = "done";
+          task.endedAt = nowIso();
+          task.exitCode = 0;
+          task.lastMessage = truncate(entry.finalMessage || "Recovered completed worker output", 1000);
+        }
+        const agent = next.agents[entry.agentId];
+        if (agent && agent.currentTaskId === entry.taskId) {
+          agent.status = "done";
+          agent.pid = undefined;
+          agent.currentTaskId = undefined;
+          agent.lastMessage = truncate(entry.finalMessage || "Recovered completed worker output", 1000);
+          agent.lastUpdate = nowIso();
+          agent.taskCount += 1;
+        } else if (agent) {
+          agent.taskCount += 1;
+        }
+        mergeCandidates(next, entry.candidateUpdates, { taskId: entry.taskId, agentId: entry.agentId });
+      }
+    });
+    for (const entry of recovered) {
+      if (entry.candidateUpdates.length) {
+        await appendEvent(runDir, {
+          time: nowIso(),
+          runId: state.runId,
+          type: "candidate.updated",
+          source: "worker",
+          agentId: entry.agentId,
+          taskId: entry.taskId,
+          message: entry.candidateUpdates.map((update) => `${update.id}=${update.status}`).join(", "),
+          data: entry.candidateUpdates
+        });
+      }
+      await appendEvent(runDir, {
+        time: nowIso(),
+        runId: state.runId,
+        type: "task.done",
+        source: "orchestrator",
+        agentId: entry.agentId,
+        taskId: entry.taskId,
+        message: `recovered completed worker output artifacts=${entry.artifactDir}`,
+        data: {
+          artifactDir: entry.artifactDir,
+          recovered: true
+        }
+      });
+    }
   }
   if (!stale.length) return;
   await updateState(runDir, (next) => {
@@ -1475,6 +1692,44 @@ async function reapDeadWorkers(runDir: string): Promise<void> {
       message: `worker pid=${entry.pid ?? "?"} not alive; marked failed`
     });
   }
+}
+
+async function recoverCompletedDeadWorker(runDir: string, task: TaskState): Promise<{ finalMessage: string; artifactDir: string } | undefined> {
+  const dir = taskDir(runDir, task.id);
+  const finalPath = path.join(dir, "final.md");
+  if (!(await pathExists(finalPath))) return undefined;
+  let finalMessage = "";
+  try {
+    finalMessage = await readFile(finalPath, "utf8");
+  } catch {
+    return undefined;
+  }
+  if (!finalMessage.trim()) return undefined;
+  if (/\bDecision:\s*(solved|continue|pivot|blocked|report-ready|keep|reject|pivot-adjacent|rotate-lane)\b/i.test(finalMessage)) {
+    return { finalMessage, artifactDir: path.join(dir, "artifacts") };
+  }
+  if (await taskCodexJsonlContainsTurnCompleted(dir)) {
+    return { finalMessage, artifactDir: path.join(dir, "artifacts") };
+  }
+  return undefined;
+}
+
+async function taskCodexJsonlContainsTurnCompleted(taskPath: string): Promise<boolean> {
+  try {
+    const raw = await readFile(path.join(taskPath, "codex.jsonl"), "utf8");
+    return raw.includes('"type":"turn.completed"') || raw.includes('"type": "turn.completed"');
+  } catch {
+    return false;
+  }
+}
+
+function hasRecentTaskActivity(taskId: string, events: HuntEvent[], now: number, graceMs: number): boolean {
+  return events.some((event) => {
+    if (event.taskId !== taskId) return false;
+    const time = Date.parse(event.time);
+    if (!Number.isFinite(time) || now - time > graceMs) return false;
+    return event.type === "codex.event" || event.type === "codex.started";
+  });
 }
 
 function allTasksTerminal(state: Awaited<ReturnType<typeof readState>>): boolean {

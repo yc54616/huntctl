@@ -47,7 +47,8 @@ const ChallengeSchema = z.object({
 const TargetSchema = z.object({
   name: z.string().min(1),
   scope: z.array(z.string()).default([]),
-  out_of_scope: z.array(z.string()).default([])
+  out_of_scope: z.array(z.string()).default([]),
+  files: z.array(z.string()).default([])
 });
 
 const ProgramSchema = z
@@ -204,7 +205,8 @@ export function createInteractiveRunbook(params: {
     target: {
       name: params.targetName || "interactive-target",
       scope: params.scope ?? [],
-      out_of_scope: params.outOfScope ?? []
+      out_of_scope: params.outOfScope ?? [],
+      files: params.files ?? []
     },
     program: {
       platform: params.platform ?? "custom",
@@ -251,20 +253,11 @@ export function resolvePromptFile(runbookPath: string, promptFile?: string): str
 
 function withDefaultAgents(profile: Runbook["profile"], agents: AgentConfig[]): AgentConfig[] {
   if (agents.length > 0) return agents;
-  if (profile === "ctf") {
-    return [
-      { id: "advisor", role: "advisor" },
-      { id: "triage-1", role: "file-triage" },
-      { id: "solver-1", role: "solver" },
-      { id: "validator-1", role: "ctf-validator" },
-      { id: "writeup-1", role: "writeup" }
-    ];
-  }
   return [
     { id: "advisor", role: "advisor" },
-    { id: "recon-1", role: "recon" },
-    { id: "validator-1", role: "validator" },
-    { id: "reporter-1", role: "report-writer" }
+    { id: "worker-1", role: "worker" },
+    { id: "worker-2", role: "worker" },
+    { id: "worker-3", role: "worker" }
   ];
 }
 
@@ -279,14 +272,11 @@ function ensureUniqueAgentIds(agents: AgentConfig[]): void {
 }
 
 function createWorkerAgents(profile: Runbook["profile"], workers: number, roles?: string[]): AgentConfig[] {
-  const defaults =
-    profile === "ctf"
-      ? ["file-triage", "solver", "ctf-validator", "writeup", "web-recon", "reverse", "crypto", "pwn"]
-      : ["recon", "validator", "report-writer", "endpoint-mapper", "evidence", "custom"];
+  void profile;
   return Array.from({ length: Math.max(1, workers) }, (_, index) => {
-    const role = roles?.[index] || defaults[index] || "custom";
+    const role = roles?.[index] || "worker";
     return {
-      id: `${role.replace(/[^a-z0-9-]/gi, "-").toLowerCase()}-${index + 1}`,
+      id: roles?.[index] ? `${role.replace(/[^a-z0-9-]/gi, "-").toLowerCase()}-${index + 1}` : `worker-${index + 1}`,
       role
     };
   });
