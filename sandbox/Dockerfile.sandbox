@@ -1,0 +1,644 @@
+# huntctl unified worker sandbox image.
+# Build once from the repository root:
+#   docker build -f sandbox/Dockerfile.sandbox -t huntctl-worker:full-next .
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TERM=xterm
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+ENV PIPX_HOME=/opt/pipx
+ENV PIPX_BIN_DIR=/usr/local/bin
+ENV ANDROID_HOME=/opt/android-sdk
+ENV ANDROID_SDK_ROOT=/opt/android-sdk
+ENV PATH="${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin:${ANDROID_SDK_ROOT}/platform-tools:${ANDROID_SDK_ROOT}/emulator:/root/.cargo/bin:/root/.local/bin:/root/.foundry/bin:/usr/local/bin:$PATH"
+
+ARG UBUNTU_MIRROR=http://mirror.navercorp.com/ubuntu
+ARG FFUF_VERSION=v2.1.0
+ARG GOBUSTER_VERSION=v3.8.2
+ARG JADX_VERSION=v1.5.5
+ARG KUBECTL_VERSION=v1.35.4
+ARG HELM_VERSION=v4.1.4
+ARG GHIDRA_VERSION=12.0.4
+ARG GHIDRA_ASSET=ghidra_12.0.4_PUBLIC_20260303.zip
+ARG NUCLEI_VERSION=3.8.0
+ARG FEROXBUSTER_VERSION=v2.13.1
+ARG HTTPX_VERSION=v1.9.0
+ARG SUBFINDER_VERSION=v2.13.0
+ARG DNSX_VERSION=v1.2.3
+ARG NAABU_VERSION=v2.5.0
+ARG KATANA_VERSION=v1.5.0
+ARG INTERACTSH_VERSION=v1.3.1
+ARG AMASS_VERSION=v5.1.1
+ARG DEX2JAR_VERSION=v2.4
+ARG KERBRUTE_VERSION=v1.0.3
+ARG MINIFORGE_VERSION=26.1.1-3
+ARG SMALI_VERSION=2.5.2
+ARG ANDROID_CMDLINE_TOOLS_VERSION=14742923
+ARG ANDROID_API_LEVEL=36
+ARG ANDROID_BUILD_TOOLS_VERSION=36.0.0
+ARG ANDROID_AVD_NAME=huntctl-api36
+ARG INSTALL_ANDROID_NDK=1
+ARG CODEX_CLI_VERSION=latest
+ARG GEMINI_CLI_VERSION=latest
+ARG CLAUDE_CLI_VERSION=latest
+ARG NODE_MAJOR=22
+
+# Use a Korean Ubuntu mirror by default; callers can override with --build-arg.
+RUN if [ -f /etc/apt/sources.list ]; then \
+        sed -i \
+            -e "s|http://archive.ubuntu.com/ubuntu|${UBUNTU_MIRROR}|g" \
+            -e "s|http://security.ubuntu.com/ubuntu|${UBUNTU_MIRROR}|g" \
+            /etc/apt/sources.list; \
+    fi \
+    && if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then \
+        sed -i \
+            -e "s|http://archive.ubuntu.com/ubuntu|${UBUNTU_MIRROR}|g" \
+            -e "s|http://security.ubuntu.com/ubuntu|${UBUNTU_MIRROR}|g" \
+            /etc/apt/sources.list.d/ubuntu.sources; \
+    fi
+
+RUN dpkg --add-architecture i386 || true
+
+# Some Ubuntu packages invoke systemd-tmpfiles during installation even though
+# this image does not run systemd as init. Pre-create the system users/groups
+# referenced by tmpfiles snippets so apt does not fail on missing identities.
+RUN set -eux; \
+    getent group systemd-journal >/dev/null || groupadd --system systemd-journal; \
+    getent group systemd-network >/dev/null || groupadd --system systemd-network; \
+    getent passwd systemd-network >/dev/null || useradd --system --gid systemd-network --home-dir /run/systemd/netif --shell /usr/sbin/nologin systemd-network; \
+    getent group systemd-resolve >/dev/null || groupadd --system systemd-resolve; \
+    getent passwd systemd-resolve >/dev/null || useradd --system --gid systemd-resolve --home-dir /run/systemd/resolve --shell /usr/sbin/nologin systemd-resolve; \
+    getent group systemd-timesync >/dev/null || groupadd --system systemd-timesync; \
+    getent passwd systemd-timesync >/dev/null || useradd --system --gid systemd-timesync --home-dir /run/systemd/timesync --shell /usr/sbin/nologin systemd-timesync
+
+# ── System packages (lane-usable CLI/headless only) ──────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # General shell / archive tooling
+    bash ca-certificates curl wget jq zip unzip p7zip-full cabextract libarchive-tools \
+    tree less rlwrap ripgrep fd-find git sqlite3 bsdextrautils xxd ncurses-term \
+    # Networking / recon / services
+    netcat-openbsd socat nmap tcpdump tshark dnsutils whois httpie wfuzz \
+    redis-tools postgresql-client default-mysql-client sqlmap whatweb nikto dirb hydra \
+    smbclient samba-common-bin krb5-user \
+    # Binary analysis / emulation / kernel
+    binutils file binwalk gdb gdb-multiarch ltrace strace patch patchelf checksec nasm \
+    upx-ucl qemu-user-static qemu-system-x86 qemu-system-misc elfutils dwarves \
+    # `linux-tools-common` provides `bpftool` on Ubuntu 24.04.
+    linux-tools-common bpftrace libbpf-dev libbpf-tools \
+    openocd avrdude srecord \
+    # Forensics / firmware / media
+    exiftool steghide pngcheck imagemagick xfsprogs sleuthkit foremost dcfldd testdisk \
+    squashfs-tools mtd-utils u-boot-tools device-tree-compiler cramfsswap fusecram \
+    ffmpeg sox tesseract-ocr tesseract-ocr-eng qpdf poppler-utils \
+    # Passwords / signatures
+    john hashcat yara \
+    # Build stacks
+    openssl libssl-dev gcc g++ make cmake golang-go rustc cargo pkg-config \
+    python3 python3-dev python3-pip python3-venv pipx \
+    ruby ruby-dev openjdk-21-jdk-headless \
+    # Windows / Android / containers / cloud
+    mono-devel mono-utils binutils-mingw-w64 mingw-w64-tools \
+    adb fastboot apktool skopeo \
+    # Android emulator/headless runtime deps
+    libpulse0 libglu1-mesa libxi6 libxrender1 libxtst6 libxkbfile1 \
+    libxshmfence1 libxcb1 libdbus-1-3 libfontconfig1 libgl1 \
+    # Math / crypto build deps
+    libgmp-dev libmpfr-dev libfplll-dev libeigen3-dev libz3-dev libblas-dev liblapack-dev \
+    libhwloc-dev libbz2-dev libmhash-dev libmcrypt-dev libjpeg-dev zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── v2 DEF CON workstation extras. These differ by mirror/architecture, so
+# keep them best-effort while preserving the full v1 toolchain above.
+RUN apt-get update && bash -euxo pipefail -c '\
+    optional=( \
+      sudo locales vim nano tmux screen rsync fzf htop procps psmisc lsof parallel \
+      masscan iputils-ping traceroute net-tools iproute2 expect \
+      nodejs npm build-essential gcc-multilib g++-multilib autoconf automake \
+      libtool ninja-build meson clang llvm lld libc6-dbg musl-tools yasm bison flex \
+      libffi-dev libseccomp-dev gdbserver default-jre unrar-free cpio zbar-tools libyara-dev \
+      android-tools-adb android-tools-fastboot gradle gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+      gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf gcc-mips-linux-gnu gcc-mipsel-linux-gnu \
+      gcc-powerpc-linux-gnu gcc-powerpc64le-linux-gnu gcc-riscv64-linux-gnu g++-riscv64-linux-gnu \
+      qemu-system-arm qemu-system-mips qemu-utils qemu-efi-aarch64 qemu-efi-arm \
+      mingw-w64 gcc-mingw-w64 g++-mingw-w64 osslsigncode zig pypy3 pari-gp fplll-tools \
+      afl++ valgrind rr rizin samdump2 volatility wine wine64 wine32:i386 winbind dosbox \
+    ); \
+    for pkg in "${optional[@]}"; do \
+      apt-get install -y --no-remove --no-install-recommends "$pkg" || echo "optional apt package skipped: $pkg"; \
+    done; \
+    rm -rf /var/lib/apt/lists/* \
+'
+
+# ── Podman (nested containers — run challenge Docker images inside sandbox) ──
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        podman buildah fuse-overlayfs slirp4netns \
+    && rm -rf /var/lib/apt/lists/* \
+    || echo "Podman install failed (non-fatal) — nested containers will not be available"
+
+# ── Cloud CLIs (official install paths) ──────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends apt-transport-https \
+    && mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+        | gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg \
+    && chmod go+r /etc/apt/keyrings/microsoft.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ noble main" \
+        > /etc/apt/sources.list.d/azure-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends azure-cli \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── radare2 ───────────────────────────────────────────────────────────────────
+RUN git clone --depth=1 https://github.com/radareorg/radare2 /tmp/r2 \
+    && cd /tmp/r2 && bash sys/install.sh --install \
+    && ldconfig \
+    && r2 -v \
+    && rm -rf /tmp/r2
+
+# ── flatter (fast lattice reduction — Keegan Ryan's fork) ────────────────────
+RUN git clone --depth=1 https://github.com/keeganryan/flatter /tmp/flatter \
+    && cmake -S /tmp/flatter -B /tmp/flatter/build -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build /tmp/flatter/build -j"$(nproc)" \
+    && cmake --install /tmp/flatter/build \
+    && ldconfig \
+    && rm -rf /tmp/flatter
+
+# ── uv (fast Python package manager) ──────────────────────────────────────────
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# ── zsteg ─────────────────────────────────────────────────────────────────────
+RUN gem install zsteg
+
+# ── Evil-WinRM ────────────────────────────────────────────────────────────────
+RUN gem install evil-winrm
+
+# ── pwn helper gems ──────────────────────────────────────────────────────────
+RUN gem install one_gadget seccomp-tools
+
+# ── Release binaries for web/recon and headless tooling ──────────────────────
+RUN arch="$(dpkg --print-architecture)" \
+    && case "$arch" in \
+        arm64) \
+            ffuf_arch="arm64"; \
+            gobuster_arch="arm64"; \
+            nuclei_arch="arm64"; \
+            ferox_arch="aarch64"; \
+            helm_arch="arm64"; \
+            kubectl_arch="arm64"; \
+            pd_arch="arm64"; \
+            gcloud_arch="arm"; \
+            amass_arch="arm64"; \
+            ;; \
+        amd64) \
+            ffuf_arch="amd64"; \
+            gobuster_arch="x86_64"; \
+            nuclei_arch="amd64"; \
+            ferox_arch="x86_64"; \
+            helm_arch="amd64"; \
+            kubectl_arch="amd64"; \
+            pd_arch="amd64"; \
+            gcloud_arch="x86_64"; \
+            amass_arch="amd64"; \
+            ;; \
+        *) echo "Unsupported arch: $arch" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://github.com/ffuf/ffuf/releases/download/${FFUF_VERSION}/ffuf_${FFUF_VERSION#v}_linux_${ffuf_arch}.tar.gz" -o /tmp/ffuf.tgz \
+    && tar -xzf /tmp/ffuf.tgz -C /tmp \
+    && install /tmp/ffuf /usr/local/bin/ffuf \
+    && rm -f /tmp/ffuf /tmp/ffuf.tgz \
+    && curl -fsSL "https://github.com/OJ/gobuster/releases/download/${GOBUSTER_VERSION}/gobuster_Linux_${gobuster_arch}.tar.gz" -o /tmp/gobuster.tgz \
+    && tar -xzf /tmp/gobuster.tgz -C /tmp \
+    && install /tmp/gobuster /usr/local/bin/gobuster \
+    && rm -f /tmp/gobuster /tmp/gobuster.tgz \
+    && curl -fsSL "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_${nuclei_arch}.zip" -o /tmp/nuclei.zip \
+    && unzip -q /tmp/nuclei.zip -d /tmp/nuclei \
+    && install /tmp/nuclei/nuclei /usr/local/bin/nuclei \
+    && rm -rf /tmp/nuclei /tmp/nuclei.zip \
+    && curl -fsSL "https://github.com/epi052/feroxbuster/releases/download/${FEROXBUSTER_VERSION}/${ferox_arch}-linux-feroxbuster.zip" -o /tmp/feroxbuster.zip \
+    && unzip -q /tmp/feroxbuster.zip -d /tmp/feroxbuster \
+    && ferox_bin="$(find /tmp/feroxbuster -type f -name feroxbuster -print -quit)" \
+    && install "$ferox_bin" /usr/local/bin/feroxbuster \
+    && rm -rf /tmp/feroxbuster /tmp/feroxbuster.zip \
+    && curl -fsSL "https://github.com/projectdiscovery/httpx/releases/download/${HTTPX_VERSION}/httpx_${HTTPX_VERSION#v}_linux_${pd_arch}.zip" -o /tmp/httpx.zip \
+    && unzip -q /tmp/httpx.zip -d /tmp/httpx \
+    && install /tmp/httpx/httpx /usr/local/bin/httpx \
+    && rm -rf /tmp/httpx /tmp/httpx.zip \
+    && curl -fsSL "https://github.com/projectdiscovery/subfinder/releases/download/${SUBFINDER_VERSION}/subfinder_${SUBFINDER_VERSION#v}_linux_${pd_arch}.zip" -o /tmp/subfinder.zip \
+    && unzip -q /tmp/subfinder.zip -d /tmp/subfinder \
+    && install /tmp/subfinder/subfinder /usr/local/bin/subfinder \
+    && rm -rf /tmp/subfinder /tmp/subfinder.zip \
+    && curl -fsSL "https://github.com/projectdiscovery/dnsx/releases/download/${DNSX_VERSION}/dnsx_${DNSX_VERSION#v}_linux_${pd_arch}.zip" -o /tmp/dnsx.zip \
+    && unzip -q /tmp/dnsx.zip -d /tmp/dnsx \
+    && install /tmp/dnsx/dnsx /usr/local/bin/dnsx \
+    && rm -rf /tmp/dnsx /tmp/dnsx.zip \
+    && curl -fsSL "https://github.com/projectdiscovery/naabu/releases/download/${NAABU_VERSION}/naabu_${NAABU_VERSION#v}_linux_${pd_arch}.zip" -o /tmp/naabu.zip \
+    && unzip -q /tmp/naabu.zip -d /tmp/naabu \
+    && install /tmp/naabu/naabu /usr/local/bin/naabu \
+    && rm -rf /tmp/naabu /tmp/naabu.zip \
+    && curl -fsSL "https://github.com/projectdiscovery/katana/releases/download/${KATANA_VERSION}/katana_${KATANA_VERSION#v}_linux_${pd_arch}.zip" -o /tmp/katana.zip \
+    && unzip -q /tmp/katana.zip -d /tmp/katana \
+    && install /tmp/katana/katana /usr/local/bin/katana \
+    && rm -rf /tmp/katana /tmp/katana.zip \
+    && curl -fsSL "https://github.com/projectdiscovery/interactsh/releases/download/${INTERACTSH_VERSION}/interactsh-client_${INTERACTSH_VERSION#v}_linux_${pd_arch}.zip" -o /tmp/interactsh.zip \
+    && unzip -q /tmp/interactsh.zip -d /tmp/interactsh \
+    && install /tmp/interactsh/interactsh-client /usr/local/bin/interactsh-client \
+    && rm -rf /tmp/interactsh /tmp/interactsh.zip \
+    && curl -fsSL "https://github.com/owasp-amass/amass/releases/download/${AMASS_VERSION}/amass_linux_${amass_arch}.tar.gz" -o /tmp/amass.tgz \
+    && mkdir -p /tmp/amass \
+    && tar -xzf /tmp/amass.tgz -C /tmp/amass \
+    && amass_bin="$(find /tmp/amass -type f -name amass -print -quit)" \
+    && install "$amass_bin" /usr/local/bin/amass \
+    && rm -rf /tmp/amass /tmp/amass.tgz \
+    && curl -fsSL "https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-${gcloud_arch}.tar.gz" -o /tmp/gcloud.tgz \
+    && mkdir -p /opt/google-cloud-cli \
+    && tar -xzf /tmp/gcloud.tgz -C /opt \
+    && /opt/google-cloud-sdk/install.sh --quiet --path-update=false --bash-completion=false --rc-path=/dev/null \
+    && ln -sf /opt/google-cloud-sdk/bin/gcloud /usr/local/bin/gcloud \
+    && rm -f /tmp/gcloud.tgz \
+    && curl -fsSL "https://github.com/skylot/jadx/releases/download/${JADX_VERSION}/jadx-${JADX_VERSION#v}.zip" -o /tmp/jadx.zip \
+    && unzip -q /tmp/jadx.zip -d /opt/jadx \
+    && ln -sf /opt/jadx/bin/jadx /usr/local/bin/jadx \
+    && rm -f /tmp/jadx.zip \
+    && curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${kubectl_arch}/kubectl" -o /usr/local/bin/kubectl \
+    && chmod +x /usr/local/bin/kubectl \
+    && curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${helm_arch}.tar.gz" -o /tmp/helm.tgz \
+    && tar -xzf /tmp/helm.tgz -C /tmp \
+    && install "/tmp/linux-${helm_arch}/helm" /usr/local/bin/helm \
+    && rm -rf /tmp/helm.tgz "/tmp/linux-${helm_arch}" \
+    && curl -fsSL "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/${GHIDRA_ASSET}" -o /tmp/ghidra.zip \
+    && unzip -q /tmp/ghidra.zip -d /opt \
+    && mv "/opt/ghidra_${GHIDRA_VERSION}_PUBLIC" /opt/ghidra \
+    && rm -f /tmp/ghidra.zip \
+    && printf '#!/usr/bin/env bash\nexec /opt/ghidra/support/analyzeHeadless "$@"\n' > /usr/local/bin/ghidra-headless \
+    && chmod +x /usr/local/bin/ghidra-headless
+
+# ── DEX / Android bytecode helpers ───────────────────────────────────────────
+RUN mkdir -p /opt/android-tools \
+    && curl -fsSL "https://github.com/pxb1988/dex2jar/releases/download/${DEX2JAR_VERSION}/dex-tools-${DEX2JAR_VERSION}.zip" -o /tmp/dex2jar.zip \
+    && unzip -q /tmp/dex2jar.zip -d /opt/android-tools \
+    && mv "/opt/android-tools/dex-tools-${DEX2JAR_VERSION}" /opt/dex2jar \
+    && printf '#!/usr/bin/env bash\nexec /opt/dex2jar/d2j-dex2jar.sh "$@"\n' > /usr/local/bin/dex2jar \
+    && chmod +x /usr/local/bin/dex2jar \
+    && rm -f /tmp/dex2jar.zip \
+    && curl -fsSL "https://repo1.maven.org/maven2/org/smali/smali/${SMALI_VERSION}/smali-${SMALI_VERSION}.jar" -o /opt/android-tools/smali.jar \
+    && curl -fsSL "https://repo1.maven.org/maven2/org/smali/baksmali/${SMALI_VERSION}/baksmali-${SMALI_VERSION}.jar" -o /opt/android-tools/baksmali.jar \
+    && printf '#!/usr/bin/env bash\nexec java -jar /opt/android-tools/smali.jar "$@"\n' > /usr/local/bin/smali \
+    && printf '#!/usr/bin/env bash\nexec java -jar /opt/android-tools/baksmali.jar "$@"\n' > /usr/local/bin/baksmali \
+    && chmod +x /usr/local/bin/smali /usr/local/bin/baksmali
+
+# ── Android SDK / Emulator / NDK ─────────────────────────────────────────────
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    if [ "$arch" = "amd64" ]; then \
+      cmd_zip="commandlinetools-linux-${ANDROID_CMDLINE_TOOLS_VERSION}_latest.zip"; \
+      mkdir -p "${ANDROID_SDK_ROOT}/cmdline-tools" /tmp/android-sdk; \
+      curl -fsSL "https://dl.google.com/android/repository/${cmd_zip}" -o /tmp/android-cmdline-tools.zip; \
+      unzip -q /tmp/android-cmdline-tools.zip -d /tmp/android-sdk; \
+      mkdir -p "${ANDROID_SDK_ROOT}/cmdline-tools/latest"; \
+      mv /tmp/android-sdk/cmdline-tools/* "${ANDROID_SDK_ROOT}/cmdline-tools/latest/"; \
+      rm -rf /tmp/android-sdk /tmp/android-cmdline-tools.zip; \
+      yes | sdkmanager --sdk_root="${ANDROID_SDK_ROOT}" --licenses >/tmp/android-sdk-licenses.log || true; \
+      yes | sdkmanager --sdk_root="${ANDROID_SDK_ROOT}" --install \
+        "cmdline-tools;latest" \
+        "platform-tools" \
+        "emulator" \
+        "platforms;android-${ANDROID_API_LEVEL}" \
+        "build-tools;${ANDROID_BUILD_TOOLS_VERSION}" \
+        "system-images;android-${ANDROID_API_LEVEL};google_apis;x86_64"; \
+      yes | sdkmanager --sdk_root="${ANDROID_SDK_ROOT}" --licenses >/tmp/android-sdk-licenses.log || true; \
+      if [ "${INSTALL_ANDROID_NDK}" = "1" ]; then \
+        ndk_pkg="$(sdkmanager --sdk_root="${ANDROID_SDK_ROOT}" --list --channel=0 \
+          | awk -F"|" '/^  ndk;[0-9]/{gsub(/^ +| +$/, "", $1); pkg=$1} END{print pkg}')"; \
+        if [ -n "$ndk_pkg" ]; then yes | sdkmanager --sdk_root="${ANDROID_SDK_ROOT}" --install "$ndk_pkg"; fi; \
+        cmake_pkg="$(sdkmanager --sdk_root="${ANDROID_SDK_ROOT}" --list --channel=0 \
+          | awk -F"|" '/^  cmake;[0-9]/{gsub(/^ +| +$/, "", $1); pkg=$1} END{print pkg}')"; \
+        if [ -n "$cmake_pkg" ]; then yes | sdkmanager --sdk_root="${ANDROID_SDK_ROOT}" --install "$cmake_pkg"; fi; \
+      fi; \
+      echo "no" | avdmanager create avd --force \
+        -n "${ANDROID_AVD_NAME}" \
+        -k "system-images;android-${ANDROID_API_LEVEL};google_apis;x86_64" >/tmp/android-avd-create.log 2>&1 \
+        || { cat /tmp/android-avd-create.log; exit 1; }; \
+      for tool in aapt aapt2 apksigner zipalign; do \
+        if [ -x "${ANDROID_SDK_ROOT}/build-tools/${ANDROID_BUILD_TOOLS_VERSION}/${tool}" ]; then \
+          ln -sf "${ANDROID_SDK_ROOT}/build-tools/${ANDROID_BUILD_TOOLS_VERSION}/${tool}" "/usr/local/bin/${tool}"; \
+        fi; \
+      done; \
+      ndk_dir="$(find "${ANDROID_SDK_ROOT}/ndk" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -1 || true)"; \
+      if [ -n "$ndk_dir" ]; then \
+        ln -sf "$ndk_dir/ndk-build" /usr/local/bin/ndk-build; \
+        llvm_dir="$ndk_dir/toolchains/llvm/prebuilt/linux-x86_64/bin"; \
+        if [ -d "$llvm_dir" ]; then \
+          ln -sf "$llvm_dir/clang" /usr/local/bin/android-clang; \
+          ln -sf "$llvm_dir/clang++" /usr/local/bin/android-clang++; \
+        fi; \
+      fi; \
+      printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'set -euo pipefail' \
+        "avd=\"\${1:-${ANDROID_AVD_NAME}}\"" \
+        'if [ "$#" -gt 0 ]; then shift; fi' \
+        'exec emulator -avd "$avd" -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -no-snapshot -wipe-data "$@"' \
+        > /usr/local/bin/android-emulator-headless; \
+      printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'set -euo pipefail' \
+        'adb wait-for-device' \
+        'until [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" = "1" ]; do sleep 2; done' \
+        'adb shell input keyevent 82 >/dev/null 2>&1 || true' \
+        > /usr/local/bin/android-wait-for-boot; \
+      chmod +x /usr/local/bin/android-emulator-headless /usr/local/bin/android-wait-for-boot; \
+      rm -f /tmp/android-sdk-licenses.log /tmp/android-avd-create.log; \
+    else \
+      echo "Android SDK/emulator install skipped on unsupported architecture: $arch"; \
+    fi
+
+# ── Recon / wordlists dataset ────────────────────────────────────────────────
+RUN mkdir -p /opt/wordlists \
+    && git clone --depth=1 https://github.com/danielmiessler/SecLists /opt/wordlists/seclists \
+    && rm -rf /opt/wordlists/seclists/.git \
+    && git clone --depth=1 https://github.com/assetnote/wordlists /opt/wordlists/assetnote \
+    && rm -rf /opt/wordlists/assetnote/.git
+
+# ── Kerberos / Windows supporting CLIs ───────────────────────────────────────
+RUN arch="$(dpkg --print-architecture)" \
+    && if [ "$arch" = "amd64" ]; then \
+        curl -fsSL "https://github.com/ropnop/kerbrute/releases/download/${KERBRUTE_VERSION}/kerbrute_linux_amd64" -o /usr/local/bin/kerbrute; \
+        chmod +x /usr/local/bin/kerbrute; \
+    else \
+        git clone --depth=1 --branch "${KERBRUTE_VERSION}" https://github.com/ropnop/kerbrute /tmp/kerbrute \
+        && cd /tmp/kerbrute \
+        && go build -o /usr/local/bin/kerbrute . \
+        && rm -rf /tmp/kerbrute; \
+    fi
+
+# ── stegseek (build from source — pre-built .deb is amd64 only) ──────────────
+RUN git clone --depth=1 https://github.com/RickdeJager/stegseek /tmp/stegseek \
+    && cmake -S /tmp/stegseek -B /tmp/stegseek/build \
+    && cmake --build /tmp/stegseek/build --target install \
+    && rm -rf /tmp/stegseek
+
+# ── Python CTF libraries (shared scripting surface) ──────────────────────────
+RUN python3 -m pip install --no-cache-dir --upgrade --ignore-installed pip setuptools wheel \
+    && python3 -m pip install --no-cache-dir --ignore-installed \
+        Pillow \
+        PyJWT \
+        angr \
+        beautifulsoup4 \
+        capstone \
+        dnfile \
+        flask \
+        fpylll \
+        gmpy2 \
+        keystone-engine \
+        lxml \
+        numpy \
+        oletools \
+        pefile \
+        pwntools \
+        py7zr \
+        pycryptodome \
+        pytesseract \
+        pyroute2 \
+        qiling \
+        requests \
+        ropgadget \
+        ropper \
+        scapy \
+        scipy \
+        sympy \
+        tqdm \
+        unicorn \
+        volatility3 \
+        z3-solver \
+        zstandard \
+    && python3 -m pip install --no-cache-dir --ignore-installed sympy \
+        torch --index-url https://download.pytorch.org/whl/cpu \
+    && python3 -m pip install --no-cache-dir --ignore-installed keras
+
+# ── Offensive/security CLIs in isolated environments ─────────────────────────
+RUN pipx install impacket \
+    && pipx install "git+https://github.com/Pennyw0rth/NetExec" \
+    && pipx install certipy-ad \
+    && pipx install "git+https://github.com/cddmp/enum4linux-ng" \
+    && pipx install frida-tools \
+    && pipx install objection \
+    && pipx install semgrep \
+    && pipx install awscli \
+    && pipx install jefferson \
+    && pipx install ubi-reader \
+    && pipx install unblob \
+    && pipx install solc-select \
+    && pipx install vyper
+
+# ── Optional bug bounty discovery helpers ────────────────────────────────────
+RUN bash -euxo pipefail -c '\
+    pipx_tools=(dirsearch arjun uro wafw00f bbot); \
+    for pkg in "${pipx_tools[@]}"; do \
+      pipx install "$pkg" || echo "optional pipx package skipped: $pkg"; \
+    done \
+'
+
+# ── Optional Go-based web recon helpers ──────────────────────────────────────
+RUN bash -euxo pipefail -c '\
+    go_tools=( \
+      github.com/tomnomnom/assetfinder@latest \
+      github.com/tomnomnom/waybackurls@latest \
+      github.com/tomnomnom/unfurl@latest \
+      github.com/tomnomnom/anew@latest \
+      github.com/tomnomnom/qsreplace@latest \
+      github.com/tomnomnom/gf@latest \
+      github.com/tomnomnom/httprobe@latest \
+      github.com/lc/gau/v2/cmd/gau@latest \
+      github.com/hahwul/dalfox/v2@latest \
+      github.com/hakluke/hakrawler@latest \
+      github.com/jaeles-project/gospider@latest \
+      github.com/haccer/subjack@latest \
+    ); \
+    for pkg in "${go_tools[@]}"; do \
+      GOBIN=/usr/local/bin go install "$pkg" || echo "optional go tool skipped: $pkg"; \
+    done \
+'
+
+# ── Slither and Foundry use their upstream-recommended install flows ─────────
+RUN uv tool install slither-analyzer \
+    && curl -fsSL https://foundry.paradigm.xyz | bash \
+    && /root/.foundry/bin/foundryup
+
+# ── pwndbg ────────────────────────────────────────────────────────────────────
+RUN git clone --depth=1 https://github.com/pwndbg/pwndbg /opt/pwndbg \
+    && cd /opt/pwndbg && ./setup.sh
+
+# ── RsaCtfTool (catch-all automated RSA/factoring attacks) ───────────────────
+RUN git clone --depth=1 https://github.com/RsaCtfTool/RsaCtfTool /opt/RsaCtfTool \
+    && python3 -m pip install --no-cache-dir --ignore-installed /opt/RsaCtfTool
+
+# ── SageMath via conda-forge (officially supported install path) ─────────────
+RUN arch="$(dpkg --print-architecture)" \
+    && case "$arch" in \
+        amd64) miniforge_arch="x86_64" ;; \
+        arm64) miniforge_arch="aarch64" ;; \
+        *) echo "Unsupported arch for Miniforge: $arch" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://github.com/conda-forge/miniforge/releases/download/${MINIFORGE_VERSION}/Miniforge3-${MINIFORGE_VERSION}-Linux-${miniforge_arch}.sh" -o /tmp/miniforge.sh \
+    && bash /tmp/miniforge.sh -b -p /opt/miniforge \
+    && rm -f /tmp/miniforge.sh \
+    && /opt/miniforge/bin/conda config --system --set channel_priority strict \
+    && /opt/miniforge/bin/conda create -y -n sage -c conda-forge sage python=3.11 \
+    && ln -sf /opt/miniforge/envs/sage/bin/sage /usr/local/bin/sage \
+    && /opt/miniforge/bin/conda clean -afy
+
+# ── CADO-NFS (Number Field Sieve — large integer factoring + DLP) ────────────
+RUN git clone --depth=1 https://gitlab.inria.fr/cado-nfs/cado-nfs.git /opt/cado-nfs \
+    && cd /opt/cado-nfs && make -j"$(nproc)"
+RUN printf '#!/usr/bin/env bash\n\
+BUILD_PARENT=/opt/cado-nfs/build\n\
+H=$(hostname)\n\
+if [ ! -d "$BUILD_PARENT/$H" ]; then\n\
+  src=$(ls -d "$BUILD_PARENT"/* 2>/dev/null | head -1)\n\
+  [ -n "$src" ] && ln -sf "$src" "$BUILD_PARENT/$H"\n\
+fi\n\
+exec python3 /opt/cado-nfs/cado-nfs.py "$@"\n' > /usr/local/bin/cado-nfs \
+    && chmod +x /usr/local/bin/cado-nfs
+
+# ── Node.js runtime for provider CLIs (Gemini CLI requires >=20) ─────────────
+RUN mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+        | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" \
+        > /etc/apt/sources.list.d/nodesource.list \
+    && apt-get update && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Provider CLIs and runtime Python deps for merged lane runtime ────────────
+RUN npm install -g --fetch-retries 5 --fetch-retry-mintimeout 60000 --fetch-retry-maxtimeout 600000 \
+        "@openai/codex@${CODEX_CLI_VERSION}" \
+        "@google/gemini-cli@${GEMINI_CLI_VERSION}" \
+        "@anthropic-ai/claude-code@${CLAUDE_CLI_VERSION}" \
+        "@samuelfaj/distill" \
+    && python3 -m pip install --no-cache-dir --ignore-installed \
+        --retries 10 \
+        --timeout 1800 \
+        pydantic-ai \
+        pydantic-settings \
+        genai-prices \
+        aiodocker \
+        claude-agent-sdk \
+        mcp \
+        httpx \
+        pyyaml \
+        rich \
+        click \
+        markdownify
+
+# Keep legacy RsaCtfTool away from the global Python environment. It pins old
+# web crypto dependencies and otherwise breaks tools like angr/claripy.
+RUN python3 -m pip uninstall -y rsactftool RsaCtfTool || true \
+    && python3 -m pip install --no-cache-dir --force-reinstall z3-solver==4.13.0.0 \
+    && python3 -m venv /opt/RsaCtfTool/.venv \
+    && /opt/RsaCtfTool/.venv/bin/python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && /opt/RsaCtfTool/.venv/bin/python -m pip install --no-cache-dir /opt/RsaCtfTool \
+    && printf '#!/usr/bin/env bash\nexec /opt/RsaCtfTool/.venv/bin/RsaCtfTool "$@"\n' \
+        > /usr/local/bin/RsaCtfTool.py \
+    && chmod +x /usr/local/bin/RsaCtfTool.py \
+    && ln -sf /usr/local/bin/RsaCtfTool.py /usr/local/bin/rsactftool \
+    && ln -sf /opt/RsaCtfTool/.venv/bin/RsaCtfTool /usr/local/bin/RsaCtfTool \
+    && ln -sf /opt/RsaCtfTool/.venv/bin/rsacrack /usr/local/bin/rsacrack
+
+# ── MCP servers from v2 ──────────────────────────────────────────────────────
+COPY sandbox/v2/mcp/ /opt/ctf-mcp/
+RUN chmod +x /opt/ctf-mcp/ctf_mcp_server.py /opt/ctf-mcp/ctf_mcp_configure.py /opt/ctf-mcp/ctf_mcp_doctor.py \
+    && ln -sf /opt/ctf-mcp/ctf_mcp_server.py /usr/local/bin/ctf-mcp-server \
+    && ln -sf /opt/ctf-mcp/ctf_mcp_configure.py /usr/local/bin/ctf-mcp-configure \
+    && ln -sf /opt/ctf-mcp/ctf_mcp_doctor.py /usr/local/bin/ctf-mcp-doctor
+
+# ── Browser runtime for MCP. Google Chrome is amd64-only; other arches keep
+# the image buildable and can mount/provide a browser binary later.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      fonts-liberation xdg-utils \
+      libasound2t64 libatk-bridge2.0-0 libatk1.0-0 libcups2 libdrm2 \
+      libgbm1 libgtk-3-0 libnspr4 libnss3 libxcomposite1 libxdamage1 \
+      libxrandr2 \
+    && arch="$(dpkg --print-architecture)" \
+    && install_chromium() { \
+        apt-get install -y --no-install-recommends chromium-browser \
+        || apt-get install -y --no-install-recommends chromium \
+        || echo "optional browser package skipped"; \
+      } \
+    && if [ "$arch" = "amd64" ]; then \
+        if curl -fsSL --retry 2 --connect-timeout 20 --max-time 180 \
+            https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+            -o /tmp/google-chrome.deb; then \
+          apt-get install -y --no-install-recommends /tmp/google-chrome.deb || install_chromium; \
+        else \
+          echo "optional google chrome download skipped"; \
+          install_chromium; \
+        fi; \
+        rm -f /tmp/google-chrome.deb; \
+      else \
+        install_chromium; \
+      fi \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN java_home="$(dirname "$(dirname "$(readlink -f "$(command -v javac)")")")" \
+    && ln -sfn "$java_home" /opt/java-home
+RUN browser="$(command -v google-chrome-stable || command -v chromium-browser || command -v chromium || true)" \
+    && if [ -n "$browser" ]; then ln -sf "$browser" /usr/local/bin/huntctl-browser; fi
+ENV JAVA_HOME=/opt/java-home
+ENV GHIDRA_JAVA_HOME=/opt/java-home
+ENV CHROME_BIN=/usr/local/bin/huntctl-browser
+ENV WORKSPACE=/workspace
+ENV DISTFILES=/distfiles
+ENV CACHE=/cache
+ENV SHARED=/shared
+ENV CTF_MCP_WORKSPACE=/workspace
+ENV CTF_MCP_DISTFILES=/distfiles
+ENV CTF_MCP_CACHE=/cache
+ENV CTF_MCP_SHARED=/shared
+RUN mkdir -p "$WORKSPACE" "$DISTFILES" "$CACHE" "$SHARED"
+
+# ── Tools reference, smoke check, and audit ──────────────────────────────────
+COPY sandbox/v1/sandbox-tools.txt /tools.txt
+COPY sandbox/v1/smoke-check.sh /usr/local/bin/sandbox-smoke-check
+COPY sandbox/v1/refresh-provider-tooling.sh /usr/local/bin/refresh-provider-tooling
+RUN chmod +x /usr/local/bin/sandbox-smoke-check /usr/local/bin/refresh-provider-tooling
+RUN printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -u' \
+    'tools=(codex distill claude gemini ctf-mcp-server ctf-mcp-configure ctf-mcp-doctor python3 pipx gcc g++ clang lld rustc cargo zig sage gp fplll gdb gdb-multiarch gdb-pwndbg checksec patchelf ROPgadget ropper RsaCtfTool RsaCtfTool.py rsacrack one_gadget seccomp-tools afl-fuzz valgrind qemu-aarch64-static qemu-arm-static qemu-mips-static qemu-system-x86_64 qemu-system-aarch64 qemu-system-arm r2 rizin rz-bin ghidra-headless binwalk tshark tcpdump nmap masscan ffuf gobuster feroxbuster nuclei httpx subfinder dnsx naabu katana amass assetfinder waybackurls unfurl anew qsreplace gf httprobe gau dalfox hakrawler gospider subjack sqlmap whatweb nikto dirsearch arjun uro wafw00f bbot jadx apktool adb fastboot sdkmanager avdmanager emulator android-emulator-headless android-wait-for-boot aapt aapt2 apksigner zipalign ndk-build android-clang gradle wine wine64 impacket-smbclient nxc certipy evil-winrm enum4linux-ng kerbrute smali baksmali dex2jar frida-ps objection steghide zsteg stegseek exiftool pngcheck yara hashcat cado-nfs forge cast anvil slither solc-select vyper aws az gcloud kubectl helm skopeo podman)' \
+    'for t in "${tools[@]}"; do if command -v "$t" >/dev/null 2>&1; then printf "ok   %s -> %s\n" "$t" "$(command -v "$t")"; else printf "miss %s\n" "$t"; fi; done' \
+    > /usr/local/bin/ctf-tool-audit \
+    && chmod +x /usr/local/bin/ctf-tool-audit
+
+# ── Final best-effort compatibility shims for distro-specific package gaps ──
+ARG ZIG_VERSION=auto
+RUN set -eux; \
+    if ! command -v zig >/dev/null 2>&1; then \
+      case "$(dpkg --print-architecture)" in \
+        amd64) zig_target="x86_64-linux" ;; \
+        arm64) zig_target="aarch64-linux" ;; \
+        *) echo "Unsupported arch for Zig: $(dpkg --print-architecture)" >&2; exit 1 ;; \
+      esac; \
+      if [ "$ZIG_VERSION" = "auto" ]; then \
+        zig_url="$(python3 -c 'import json, sys, urllib.request; target=sys.argv[1]; data=json.load(urllib.request.urlopen("https://ziglang.org/download/index.json", timeout=60)); versions=sorted([v for v in data if v!="master" and all(p.isdigit() for p in v.split("."))], key=lambda v: tuple(map(int, v.split("."))), reverse=True); print(next(data[v][target]["tarball"] for v in versions if target in data[v] and data[v][target].get("tarball")))' "$zig_target")"; \
+      else \
+        zig_url="https://ziglang.org/download/${ZIG_VERSION}/zig-${zig_target}-${ZIG_VERSION}.tar.xz"; \
+      fi; \
+      mkdir -p /opt/zig; \
+      curl -fsSL "$zig_url" -o /tmp/zig.tar.xz; \
+      tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1; \
+      rm -f /tmp/zig.tar.xz; \
+      ln -sf /opt/zig/zig /usr/local/bin/zig; \
+    fi; \
+    if ! command -v gdb-pwndbg >/dev/null 2>&1; then \
+      printf '%s\n' '#!/usr/bin/env bash' 'exec gdb -q -ex "source /opt/pwndbg/gdbinit.py" "$@"' > /usr/local/bin/gdb-pwndbg; \
+      chmod +x /usr/local/bin/gdb-pwndbg; \
+    fi; \
+    if ! command -v pwndbg >/dev/null 2>&1; then ln -sf /usr/local/bin/gdb-pwndbg /usr/local/bin/pwndbg; fi; \
+    if ! command -v rizin >/dev/null 2>&1 && command -v r2 >/dev/null 2>&1; then ln -sf "$(command -v r2)" /usr/local/bin/rizin; fi; \
+    if ! command -v rz-bin >/dev/null 2>&1 && command -v rabin2 >/dev/null 2>&1; then ln -sf "$(command -v rabin2)" /usr/local/bin/rz-bin; fi; \
+    if ! command -v rz-asm >/dev/null 2>&1 && command -v rasm2 >/dev/null 2>&1; then ln -sf "$(command -v rasm2)" /usr/local/bin/rz-asm; fi; \
+    if ! command -v rz-find >/dev/null 2>&1 && command -v rafind2 >/dev/null 2>&1; then ln -sf "$(command -v rafind2)" /usr/local/bin/rz-find; fi; \
+    if ! command -v wine64 >/dev/null 2>&1 && command -v wine >/dev/null 2>&1; then ln -sf "$(command -v wine)" /usr/local/bin/wine64; fi; \
+    if ! command -v impacket-smbclient >/dev/null 2>&1 && command -v smbclient.py >/dev/null 2>&1; then ln -sf "$(command -v smbclient.py)" /usr/local/bin/impacket-smbclient; fi
+
+WORKDIR /workspace
+CMD ["/bin/bash"]

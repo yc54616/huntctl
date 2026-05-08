@@ -1,0 +1,33 @@
+profile: ctf
+
+sandbox:
+  mode: docker
+  image: huntctl-worker:latest
+
+challenge:
+  name: baby-web
+  description: |
+    로그인 우회해서 flag를 얻는 문제.
+  files:
+    - ./challenge.zip
+  category: web
+
+advisor:
+  mode: auto
+  interval_seconds: 60
+  can_assign_workers: true
+  can_stop_workers: true
+
+limits:
+  max_parallel_agents: 3
+  timeout_minutes: 45
+
+agents:
+  - id: advisor
+    role: advisor
+  - id: triage-1
+    role: file-triage
+  - id: solver-1
+    role: solver
+  - id: writeup-1
+    role: writeup

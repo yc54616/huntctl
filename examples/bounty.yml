@@ -1,0 +1,52 @@
+profile: bug-bounty
+
+sandbox:
+  mode: docker
+  image: huntctl-worker:latest
+
+target:
+  name: example-program
+  scope:
+    - https://app.example.com
+    - https://api.example.com
+  out_of_scope:
+    - https://admin.example.com
+
+program:
+  platform: bugcrowd
+  description: |
+    SaaS collaboration app. Authenticated testing allowed.
+  report_template: ../templates/bug-bounty-report.md
+  bugcrowd_vrt_path: ../vulnerability-rating-taxonomy.json
+  vrt:
+    - broken access control
+    - IDOR
+    - auth bypass
+    - SSRF
+  weaknesses:
+    - CWE-639
+    - CWE-862
+    - OWASP A01
+  rules:
+    rate_limit: conservative
+    destructive_testing: false
+
+advisor:
+  mode: auto
+  interval_seconds: 60
+  can_assign_workers: true
+  can_stop_workers: true
+
+limits:
+  max_parallel_agents: 3
+  timeout_minutes: 45
+
+agents:
+  - id: advisor
+    role: advisor
+  - id: recon-1
+    role: recon
+  - id: validator-1
+    role: validator
+  - id: reporter-1
+    role: report-writer

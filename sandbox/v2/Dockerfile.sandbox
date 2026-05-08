@@ -1,0 +1,340 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=UTC \
+    LANG=C.UTF-8
+
+ARG APT_MIRROR=http://mirror.navercorp.com/ubuntu/
+
+RUN sed -i \
+    -e "s|http://archive.ubuntu.com/ubuntu/|${APT_MIRROR}|g" \
+    -e "s|http://security.ubuntu.com/ubuntu/|${APT_MIRROR}|g" \
+    /etc/apt/sources.list.d/ubuntu.sources
+
+RUN dpkg --add-architecture i386
+
+# Base CTF workstation tools. Keep core packages mandatory; less reliable
+# ecosystem packages are installed in best-effort blocks below.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates sudo locales \
+    # Shell & core utils
+    bash curl wget git vim nano less file tree jq tmux screen rsync \
+    ripgrep fd-find fzf htop procps psmisc lsof parallel \
+    # Network tools
+    netcat-openbsd nmap masscan iputils-ping traceroute dnsutils whois \
+    net-tools iproute2 socat rlwrap expect tcpdump tshark \
+    # HTTP tools
+    httpie \
+    # Crypto / encoding
+    openssl xxd binutils binutils-multiarch bsdextrautils \
+    # Python
+    python3 python3-dev python3-pip python3-venv pipx ipython3 \
+    # Ruby (for various tools)
+    ruby ruby-dev \
+    # Node.js
+    nodejs npm \
+    # Build tools
+    build-essential gcc g++ gcc-multilib g++-multilib make cmake \
+    autoconf automake libtool pkg-config ninja-build meson \
+    clang llvm lld libc6-dbg musl-tools nasm yasm bison flex \
+    libssl-dev libffi-dev libseccomp-dev \
+    # Cross compile and emulation
+    qemu-user qemu-user-static qemu-system-x86 qemu-system-arm \
+    qemu-system-mips qemu-system-ppc qemu-system-misc binfmt-support \
+    # Binary analysis
+    gdb gdbserver gdb-multiarch ltrace strace elfutils dwarves \
+    default-jre \
+    # Web / automation
+    chromium-browser \
+    # Archive / compression
+    zip unzip p7zip-full unrar-free cpio squashfs-tools \
+    # Image tools
+    imagemagick \
+    # Forensics / traffic
+    binwalk foremost sleuthkit testdisk libimage-exiftool-perl \
+    pngcheck zbar-tools yara libyara-dev \
+    # Android basics
+    android-tools-adb android-tools-fastboot \
+    # Misc CTF tools
+    patchelf checksec \
+    && rm -rf /var/lib/apt/lists/*
+
+# Optional apt packages. Package availability differs across Ubuntu mirrors;
+# missing tools should not break the base image build.
+RUN apt-get update && bash -euxo pipefail -c '\
+    optional=( \
+      gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+      gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
+      gcc-mips-linux-gnu gcc-mipsel-linux-gnu \
+      gcc-powerpc-linux-gnu gcc-powerpc64le-linux-gnu \
+      gcc-riscv64-linux-gnu g++-riscv64-linux-gnu \
+      mingw-w64 gcc-mingw-w64 g++-mingw-w64 osslsigncode \
+      rustc cargo zig pypy3 sagemath pari-gp fplll-tools \
+      radare2 rizin apktool jadx dex2jar smali baksmali upx-ucl \
+      steghide outguess john hashcat samdump2 foremost volatility \
+      wine wine64 wine32:i386 winbind dosbox \
+    ); \
+    for pkg in "${optional[@]}"; do \
+      apt-get install -y --no-remove --no-install-recommends "$pkg" || echo "optional apt package skipped: $pkg"; \
+    done; \
+    rm -rf /var/lib/apt/lists/* \
+'
+
+# SageMath is not consistently available from Ubuntu 24.04 apt repositories.
+# Install it from conda-forge with micromamba, matching the official Sage
+# installation path. Keep this best-effort so network/solver failures do not
+# block the rest of the DEF CON workstation image.
+ENV MAMBA_ROOT_PREFIX=/opt/micromamba
+RUN bash -euxo pipefail -c '\
+    if command -v sage >/dev/null 2>&1; then exit 0; fi; \
+    curl -fsSL --connect-timeout 20 --max-time 180 https://micro.mamba.pm/api/micromamba/linux-64/latest -o /tmp/micromamba.tar.bz2; \
+    rm -rf /tmp/micromamba; mkdir -p /tmp/micromamba; \
+    tar -xjf /tmp/micromamba.tar.bz2 -C /tmp/micromamba bin/micromamba; \
+    install -m 0755 /tmp/micromamba/bin/micromamba /usr/local/bin/micromamba; \
+    rm -rf /tmp/micromamba /tmp/micromamba.tar.bz2; \
+    micromamba create -y -n sage -c conda-forge --strict-channel-priority sage python=3.12; \
+    micromamba clean -a -y; \
+    ln -sf /opt/micromamba/envs/sage/bin/sage /usr/local/bin/sage; \
+    if [ -x /opt/micromamba/envs/sage/bin/sage-python ]; then ln -sf /opt/micromamba/envs/sage/bin/sage-python /usr/local/bin/sage-python; fi \
+' || echo "WARNING: optional SageMath micromamba install failed"
+
+# Python packages. Keep CTF Python tooling in a venv so pip does not try to
+# uninstall Debian-owned packages such as traitlets/ipython.
+ENV CTF_PYTHON_VENV=/opt/ctf-python
+RUN python3 -m venv "$CTF_PYTHON_VENV" \
+    && "$CTF_PYTHON_VENV/bin/python" -m pip install --no-cache-dir --upgrade pip setuptools wheel
+ENV VIRTUAL_ENV=/opt/ctf-python
+ENV PATH=/opt/ctf-python/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+RUN /opt/ctf-python/bin/python -m pip install --no-cache-dir \
+    requests httpx aiohttp \
+    pwntools \
+    pycryptodome cryptography \
+    sympy networkx \
+    pillow \
+    z3-solver \
+    beautifulsoup4 lxml \
+    scapy \
+    flask fastapi uvicorn \
+    jupyter \
+    capstone unicorn keystone-engine \
+    ROPGadget ropper \
+    lief r2pipe python-magic construct \
+    frida-tools oletools volatility3 yara-python \
+    rich tqdm ipython
+
+# Heavy symbolic execution packages are useful but can fail due to transient
+# resolver/build issues. Install best-effort so the image remains buildable.
+RUN /opt/ctf-python/bin/python -m pip install --no-cache-dir angr claripy cle archinfo pyvex || true
+
+# Ruby exploitation helpers.
+RUN gem install one_gadget seccomp-tools --no-document || true
+
+# Node packages
+# Network hiccups during npm fetches are common in Docker builds, so install
+# provider CLIs with retries and keep optional web tooling best-effort.
+RUN npm config set registry https://registry.npmjs.org/ \
+    && npm config set fetch-retries 5 \
+    && npm config set fetch-retry-mintimeout 20000 \
+    && npm config set fetch-retry-maxtimeout 120000 \
+    && npm config set fetch-timeout 300000 \
+    && bash -euxo pipefail -c '\
+        retry_npm() { \
+            local package="$1"; \
+            local attempt; \
+            for attempt in 1 2 3 4 5; do \
+                npm install -g --no-audit --no-fund "$package" && return 0; \
+                sleep "$((attempt * 10))"; \
+            done; \
+            return 1; \
+        }; \
+        retry_npm @anthropic-ai/claude-code; \
+        retry_npm @openai/codex; \
+        retry_npm retire || echo "WARNING: optional npm package retire failed"; \
+        retry_npm wappalyzer-cli || echo "WARNING: optional npm package wappalyzer-cli failed"; \
+        retry_npm prettier || echo "WARNING: optional npm package prettier failed"; \
+        retry_npm javascript-obfuscator || echo "WARNING: optional npm package javascript-obfuscator failed"; \
+        npm cache clean --force \
+    '
+
+# Go (for subfinder, httpx, ffuf, etc.)
+RUN wget -q https://go.dev/dl/go1.22.2.linux-amd64.tar.gz -O /tmp/go.tar.gz \
+    && tar -C /usr/local -xzf /tmp/go.tar.gz \
+    && rm /tmp/go.tar.gz
+ENV PATH=$PATH:/usr/local/go/bin:/root/go/bin
+
+# Install Go-based tools (non-fatal — best effort)
+RUN go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest 2>/dev/null || true \
+    && go install github.com/projectdiscovery/httpx/cmd/httpx@latest 2>/dev/null || true \
+    && go install github.com/ffuf/ffuf/v2@latest 2>/dev/null || true \
+    && go install github.com/OJ/gobuster/v3@latest 2>/dev/null || true \
+    && go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest 2>/dev/null || true \
+    && go install github.com/projectdiscovery/katana/cmd/katana@latest 2>/dev/null || true \
+    && go install github.com/projectdiscovery/dnsx/cmd/dnsx@latest 2>/dev/null || true \
+    && go install github.com/projectdiscovery/naabu/v2/cmd/naabu@latest 2>/dev/null || true \
+    && go install github.com/tomnomnom/waybackurls@latest 2>/dev/null || true \
+    && go install github.com/tomnomnom/anew@latest 2>/dev/null || true \
+    && go install github.com/tomnomnom/gf@latest 2>/dev/null || true \
+    && go install github.com/hakluke/hakrawler@latest 2>/dev/null || true \
+    && go install github.com/lc/gau/v2/cmd/gau@latest 2>/dev/null || true \
+    && go install github.com/hahwul/dalfox/v2@latest 2>/dev/null || true
+
+# GDB frontends. Keep wrappers separate so pwndbg/gef do not fight over
+# /root/.gdbinit.
+RUN git clone --depth 1 https://github.com/pwndbg/pwndbg /opt/pwndbg \
+    && cd /opt/pwndbg \
+    && ./setup.sh || true
+RUN curl -fsSL https://gef.blah.cat/py -o /opt/gef.py || true \
+    && printf '%s\n' '#!/usr/bin/env bash' 'exec gdb -q -ex "source /opt/gef.py" "$@"' > /usr/local/bin/gdb-gef \
+    && chmod +x /usr/local/bin/gdb-gef \
+    && printf '%s\n' '#!/usr/bin/env bash' 'exec gdb -q -ex "source /opt/pwndbg/gdbinit.py" "$@"' > /usr/local/bin/gdb-pwndbg \
+    && chmod +x /usr/local/bin/gdb-pwndbg
+
+# Ghidra headless, best-effort latest public release.
+RUN bash -euxo pipefail -c '\
+    api=https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest; \
+    url="$(curl -fsSL "$api" | jq -r ".assets[].browser_download_url | select(test(\"PUBLIC.*zip$\"))" | head -1 || true)"; \
+    if [ -n "$url" ] && [ "$url" != "null" ]; then \
+      wget -q "$url" -O /tmp/ghidra.zip; \
+      unzip -q /tmp/ghidra.zip -d /opt; \
+      rm /tmp/ghidra.zip; \
+      ln -sf /opt/ghidra*/support/analyzeHeadless /usr/local/bin/ghidra-headless; \
+    else \
+      echo "WARNING: ghidra latest release URL not found"; \
+    fi \
+' || true
+
+# Android and reverse-engineering tools that are often missing from Ubuntu
+# repos. Pull release binaries directly and keep the build non-fatal.
+RUN bash -euxo pipefail -c '\
+    api=https://api.github.com/repos/skylot/jadx/releases/latest; \
+    url="$(curl -fsSL "$api" | jq -r ".assets[].browser_download_url | select(test(\"jadx-[0-9].*\\\\.zip$\"))" | head -1 || true)"; \
+    if [ -n "$url" ] && [ "$url" != "null" ]; then \
+      wget -q "$url" -O /tmp/jadx.zip; \
+      rm -rf /opt/jadx; \
+      mkdir -p /opt/jadx; \
+      unzip -q /tmp/jadx.zip -d /opt/jadx; \
+      rm /tmp/jadx.zip; \
+      chmod +x /opt/jadx/bin/jadx /opt/jadx/bin/jadx-gui || true; \
+      ln -sf /opt/jadx/bin/jadx /usr/local/bin/jadx; \
+      ln -sf /opt/jadx/bin/jadx-gui /usr/local/bin/jadx-gui; \
+    else \
+      echo "WARNING: jadx latest release URL not found"; \
+    fi \
+' || true
+
+RUN bash -euxo pipefail -c '\
+    api=https://api.github.com/repos/rizinorg/rizin/releases/latest; \
+    url="$(curl -fsSL "$api" | jq -r ".assets[].browser_download_url | select(test(\"static-x86_64.*tar.xz$\"))" | head -1 || true)"; \
+    if [ -n "$url" ] && [ "$url" != "null" ]; then \
+      wget -q "$url" -O /tmp/rizin.tar.xz; \
+      rm -rf /opt/rizin; \
+      mkdir -p /opt/rizin; \
+      tar -xJf /tmp/rizin.tar.xz -C /opt/rizin; \
+      rm /tmp/rizin.tar.xz; \
+      for bin in rizin rz-asm rz-ax rz-bin rz-diff rz-find rz-gg rz-hash rz-run rz-sign; do \
+        if [ -x "/opt/rizin/bin/$bin" ]; then ln -sf "/opt/rizin/bin/$bin" "/usr/local/bin/$bin"; fi; \
+      done; \
+    else \
+      echo "WARNING: rizin static release URL not found"; \
+    fi \
+' || true
+
+# Some Ubuntu Wine packages install loaders under /usr/lib/wine without the
+# meta-package wrapper. Expose the conventional commands when possible.
+RUN bash -euxo pipefail -c '\
+    if ! command -v wine >/dev/null 2>&1 && [ -x /usr/lib/wine/wine ]; then ln -sf /usr/lib/wine/wine /usr/local/bin/wine; fi; \
+    if ! command -v wine64 >/dev/null 2>&1 && [ -x /usr/lib/wine/wine64 ]; then ln -sf /usr/lib/wine/wine64 /usr/local/bin/wine64; fi; \
+    if ! command -v wineserver >/dev/null 2>&1 && [ -x /usr/lib/wine/wineserver64 ]; then ln -sf /usr/lib/wine/wineserver64 /usr/local/bin/wineserver; fi \
+'
+
+# Quick environment audit for agents/operators.
+RUN printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -u' \
+    'tools=(python3 pip3 gcc g++ clang lld rustc cargo zig pypy3 micromamba sage gp fplll x86_64-w64-mingw32-gcc i686-w64-mingw32-gcc gdb gdb-multiarch gdb-pwndbg gdb-gef checksec patchelf ROPgadget ropper one_gadget seccomp-tools qemu-aarch64-static qemu-arm-static qemu-mips-static qemu-riscv64-static qemu-system-x86_64 qemu-system-aarch64 r2 rizin rz-bin ghidra-headless google-chrome-stable binwalk tshark tcpdump nmap masscan ffuf gobuster nuclei katana sqlmap jadx apktool wine wine64 ctf-mcp-server ctf-mcp-configure ctf-mcp-doctor)' \
+    'for t in "${tools[@]}"; do if command -v "$t" >/dev/null 2>&1; then printf "ok   %s -> %s\n" "$t" "$(command -v "$t")"; else printf "miss %s\n" "$t"; fi; done' \
+    > /usr/local/bin/ctf-tool-audit \
+    && chmod +x /usr/local/bin/ctf-tool-audit
+
+# SQLMap
+RUN git clone --depth 1 https://github.com/sqlmapproject/sqlmap /opt/sqlmap \
+    && ln -s /opt/sqlmap/sqlmap.py /usr/local/bin/sqlmap || true
+
+# SecLists wordlists (trimmed). Do not let wordlist download block the whole
+# image indefinitely; operators can mount a fuller host wordlist cache later.
+RUN timeout 240 git clone --depth 1 --filter=blob:limit=10m \
+    https://github.com/danielmiessler/SecLists /opt/SecLists 2>/dev/null \
+    || rm -rf /opt/SecLists
+
+# Zig is not consistently available from Ubuntu mirrors. pwndbg brings a
+# ziglang wheel, so expose that binary globally and fall back to upstream only
+# if the bundled copy is unavailable.
+RUN bash -euxo pipefail -c '\
+    bundled="$(find /opt/pwndbg -path "*/site-packages/ziglang/zig" -type f -perm /111 -print -quit || true)"; \
+    if [ -n "$bundled" ]; then \
+      ln -sf "$bundled" /usr/local/bin/zig; \
+      exit 0; \
+    fi; \
+    meta=/tmp/zig-index.json; \
+    curl -fsSL --connect-timeout 20 --max-time 120 https://ziglang.org/download/index.json -o "$meta"; \
+    url="$(jq -r "[to_entries[] | select(.key | test(\"^[0-9]+\\\\.[0-9]+\\\\.[0-9]+$\"))] | sort_by(.key | split(\".\") | map(tonumber)) | last | .value.\"x86_64-linux\".tarball" "$meta")"; \
+    test -n "$url" && test "$url" != "null"; \
+    curl -fL --connect-timeout 20 --max-time 300 "$url" -o /tmp/zig.tar.xz; \
+    rm -rf /opt/zig; \
+    mkdir -p /opt/zig; \
+    tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1; \
+    rm -f /tmp/zig.tar.xz "$meta"; \
+    ln -sf /opt/zig/zig /usr/local/bin/zig \
+'
+
+# MCP servers for agent-controlled CTF tooling. These servers start quickly and
+# only launch heavy tools such as Chrome/Ghidra when their MCP tools are called.
+COPY sandbox/mcp/ /opt/ctf-mcp/
+RUN /opt/ctf-python/bin/python -m pip install --no-cache-dir mcp \
+    && chmod +x /opt/ctf-mcp/ctf_mcp_server.py /opt/ctf-mcp/ctf_mcp_configure.py /opt/ctf-mcp/ctf_mcp_doctor.py \
+    && ln -sf /opt/ctf-mcp/ctf_mcp_server.py /usr/local/bin/ctf-mcp-server \
+    && ln -sf /opt/ctf-mcp/ctf_mcp_configure.py /usr/local/bin/ctf-mcp-configure \
+    && ln -sf /opt/ctf-mcp/ctf_mcp_doctor.py /usr/local/bin/ctf-mcp-doctor
+
+# Real browser and JDK runtime for MCP Chrome/Ghidra. Ubuntu's chromium-browser
+# package is a snap stub in Docker; install Google Chrome directly.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      openjdk-21-jdk-headless \
+      fonts-liberation xdg-utils \
+      libasound2t64 libatk-bridge2.0-0 libatk1.0-0 libcups2 libdrm2 \
+      libgbm1 libgtk-3-0 libnspr4 libnss3 libxcomposite1 libxdamage1 \
+      libxrandr2 \
+    && wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/google-chrome.deb \
+    && apt-get install -y --no-install-recommends /tmp/google-chrome.deb \
+    && rm -f /tmp/google-chrome.deb \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64 \
+    GHIDRA_JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+
+# Conda-forge Sage expects its environment to be activated. Without this,
+# Singular is off PATH, and Sage's package-system feature checks can recursively
+# invoke `sage -p`/`sage -pip` during import. Patch that check and expose
+# activation-style wrappers for non-interactive MCP/solver use.
+RUN bash -euxo pipefail -c '\
+    if [ -x /opt/micromamba/envs/sage/bin/sage ]; then \
+      python3 -c "from pathlib import Path; old=\"more_package_systems = [SagePackageSystem(), PipPackageSystem()]\"; new=\"more_package_systems = []  # patched by ctf-sandbox: avoid recursive sage subprocess checks\"; [p.write_text(p.read_text().replace(old, new)) for p in Path(\"/opt/micromamba/envs/sage/lib\").glob(\"python*/site-packages/sage/features/__init__.py\") if old in p.read_text()]"; \
+      rm -f /usr/local/bin/sage /usr/local/bin/sage-python; \
+      printf "%s\n" "#!/usr/bin/env bash" "export PATH=\"/opt/micromamba/envs/sage/bin:\$PATH\"" "exec /opt/micromamba/envs/sage/bin/sage \"\$@\"" > /usr/local/bin/sage; \
+      printf "%s\n" "#!/usr/bin/env bash" "export PATH=\"/opt/micromamba/envs/sage/bin:\$PATH\"" "exec /opt/micromamba/envs/sage/bin/python \"\$@\"" > /usr/local/bin/sage-python; \
+      chmod +x /usr/local/bin/sage /usr/local/bin/sage-python; \
+    fi \
+'
+
+# Directory structure for sandbox paths
+ENV WORKSPACE=/workspace \
+    DISTFILES=/distfiles \
+    CACHE=/cache \
+    SHARED=/shared
+
+RUN mkdir -p $WORKSPACE $DISTFILES $CACHE $SHARED
+
+WORKDIR /workspace
+
+CMD ["/bin/bash"]
