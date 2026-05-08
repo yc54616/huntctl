@@ -66,6 +66,12 @@ export async function renderNativeStatus(runDir: string, dockerMessage?: string)
     kv("환경", `${state.sandboxMode} full-access / ${image}`, width),
     kv("토큰", formatTokenUsage(tokens), width),
     "",
+    section("worker 현황"),
+    ...workerSnapshotLines(state, events, width),
+    "",
+    section("후보 판정"),
+    ...candidateSnapshotLines(state, width),
+    "",
     section("advisor 판단"),
     paragraph(authIssue ? "Codex 인증 실패가 감지됐습니다. worker가 일을 계속하려면 `codex login` 또는 `~/.codex` 인증 복구가 필요합니다." : humanAdvisorSummary(state.advisor.lastResponse), width),
     "",
@@ -232,6 +238,126 @@ function humanAdvisorSummary(value?: string): string {
     return "advisor가 켜져 있고 worker 결과를 계속 확인하는 중입니다.";
   }
   return truncate(text, 360);
+}
+
+function workerSnapshotLines(state: Awaited<ReturnType<typeof readState>>, events: HuntEvent[], width: number): string[] {
+  const workers = Object.values(state.agents).filter((agent) => agent.id !== "advisor" && agent.role !== "advisor");
+  if (!workers.length) return [dim("worker 없음")];
+  const lines: string[] = [];
+  for (const worker of workers) {
+    const task = worker.currentTaskId ? state.tasks[worker.currentTaskId] : undefined;
+    const age = task?.startedAt ? `작업 ${elapsedShort(task.startedAt)}` : "대기";
+    const taskSummary = task ? summarizeTaskPrompt(task.prompt, task.reason, worker.role) : "다음 작업 대기 중";
+    const latest = truncate(latestWorkerActivity(events, worker.id), 180);
+    const head = `${strong(worker.id)} ${statusBadge(worker.status)} ${dim(workerRoleKo(worker.role))} ${dim(age)}`;
+    lines.push(head);
+    lines.push(...indentWrapped(`목표: ${taskSummary}`, width));
+    lines.push(...indentWrapped(`최근: ${latest}`, width));
+  }
+  return lines;
+}
+
+function candidateSnapshotLines(state: Awaited<ReturnType<typeof readState>>, width: number): string[] {
+  const allCandidates = Object.values(state.candidates ?? {}).filter((candidate) => candidate.id !== "candidate-ledger-current");
+  if (!allCandidates.length) return [dim("아직 후보 없음")];
+  const counts = countBy(allCandidates.map((candidate) => candidate.status));
+  const candidates = allCandidates.sort(candidateSort).slice(0, 4);
+  const lines = [
+    dim(
+      `report-ready ${counts["report-ready"] ?? 0} / keep ${counts.keep ?? 0} / 입력필요 ${counts.blocked ?? 0} / reject ${counts.reject ?? 0}`
+    )
+  ];
+  for (const candidate of candidates) {
+    const title = `${candidate.id} ${candidateStatusBadge(candidate.status)}${candidate.lane ? ` ${dim(candidate.lane)}` : ""}`;
+    lines.push(title, ...indentWrapped(candidateOneLine(candidate), width));
+  }
+  return lines;
+}
+
+function candidateOneLine(candidate: Awaited<ReturnType<typeof readState>>["candidates"][string]): string {
+  if (candidate.status === "report-ready") return truncate(candidate.impact || candidate.capability || "제출 가능 후보", 180);
+  if (candidate.status === "blocked") return truncate(`막힘: ${candidate.missingProof || candidate.notes || "추가 입력/증거 필요"}`, 180);
+  if (candidate.status === "keep") return truncate(`계속: ${candidate.capability || candidate.notes || "추가 검증 가치 있음"}`, 180);
+  if (candidate.status === "pivot-adjacent" || candidate.status === "rotate-lane") {
+    return truncate(`전환: ${candidate.notes || candidate.missingProof || "다른 표면으로 이동 필요"}`, 180);
+  }
+  return truncate(`제외: ${candidate.impact || candidate.notes || candidate.missingProof || "공격자 영향 미입증"}`, 180);
+}
+
+function candidateStatusBadge(status: string): string {
+  if (status === "blocked") return badge("입력필요", "yellow");
+  return statusBadge(status);
+}
+
+function candidateSort(
+  left: Awaited<ReturnType<typeof readState>>["candidates"][string],
+  right: Awaited<ReturnType<typeof readState>>["candidates"][string]
+): number {
+  const priority: Record<string, number> = {
+    "report-ready": 0,
+    keep: 1,
+    blocked: 2,
+    "pivot-adjacent": 3,
+    "rotate-lane": 4,
+    continue: 5,
+    pivot: 6,
+    reject: 7,
+    solved: 0
+  };
+  const diff = (priority[left.status] ?? 9) - (priority[right.status] ?? 9);
+  if (diff !== 0) return diff;
+  return right.lastDecisionAt.localeCompare(left.lastDecisionAt);
+}
+
+function countBy(values: string[]): Record<string, number> {
+  return values.reduce<Record<string, number>>((counts, value) => {
+    counts[value] = (counts[value] ?? 0) + 1;
+    return counts;
+  }, {});
+}
+
+function latestWorkerActivity(events: HuntEvent[], agentId: string): string {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event.agentId !== agentId) continue;
+    const summary = workerActivitySummary(event);
+    if (summary) return `${clockTime(event.time)} ${summary}`;
+  }
+  return "최근 활동 없음";
+}
+
+function workerActivitySummary(event: HuntEvent): string | undefined {
+  if (event.type === "codex.started") return "Docker/Codex worker 시작";
+  if (event.type === "task.done") return `작업 완료${event.message ? `: ${truncate(oneLine(event.message), 160)}` : ""}`;
+  if (event.type === "task.failed") return `작업 실패${event.message ? `: ${truncate(oneLine(event.message), 160)}` : ""}`;
+  if (event.type !== "codex.event") return undefined;
+
+  const data = objectRecord(event.data);
+  const type = typeof data?.type === "string" ? data.type : event.message;
+  if (type === "turn.started") return "모델이 결과를 분석하는 중";
+  if (type === "turn.completed") return `모델 응답 완료: ${formatTokenUsage(tokenUsageFromUsage(data?.usage))}`;
+
+  const item = objectRecord(data?.item);
+  if (!item) return undefined;
+  if (item.type === "agent_message" && typeof item.text === "string") {
+    const parsed = parseMaybeJson(item.text);
+    const response = typeof parsed?.response === "string" ? parsed.response : undefined;
+    const summary = typeof parsed?.summary === "string" ? parsed.summary : undefined;
+    return `판단: ${truncate(oneLine(response ?? summary ?? item.text), 180)}`;
+  }
+  if (item.type === "command_execution") {
+    const command = commandText(item, event.message);
+    if (type === "item.started") return `확인 중: ${summarizeCommand(command)}`;
+    if (type === "item.completed") {
+      const output = typeof item.aggregated_output === "string" ? item.aggregated_output : typeof item.text === "string" ? item.text : "";
+      return `${summarizeCommand(command)} / ${summarizeCommandOutput(output).replace(/^결과: /, "")}`;
+    }
+  }
+  return undefined;
+}
+
+function indentWrapped(value: string, width: number): string[] {
+  return wrapText(value, Math.max(12, width - 3)).map((line) => `${color("gray", "  ")}${line}`);
 }
 
 function workerFeedLine(event: HuntEvent, title: string, detail: string): string {
@@ -673,6 +799,19 @@ function elapsedMinutes(iso?: string): string {
   if (hours) parts.push(`${hours}시간`);
   parts.push(`${minutes}분`);
   return parts.join(" ");
+}
+
+function elapsedShort(iso?: string): string {
+  if (!iso) return "-";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "-";
+  const totalSeconds = Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000));
+  if (totalSeconds < 60) return "<1분째";
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  if (totalMinutes < 60) return `${totalMinutes}분째`;
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return `${hours}시간 ${minutes}분째`;
 }
 
 function workerRoleKo(role: string): string {

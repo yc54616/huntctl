@@ -555,6 +555,14 @@ Bug bounty
 반대로 버그바운티에서는 첫 요청이 애매하다고 바로 버리지는 않습니다. 한 candidate를 충분히
 깊게 검증하되, 같은 asset/surface/vulnerability class에서 새 증거가 계속 나오지 않으면
 candidate ledger에 `blocked`, `reject`, `pivot-adjacent`, `rotate-lane` 근거를 남기고 다른 lane으로 이동합니다.
+기본 scheduler는 VRT/weakness lane을 골고루 돌면서도, 될 것 같은 후보가 생기면 validator/report
+worker를 그 후보에 바로 붙여 `report-ready`, `keep`, `reject` 중 하나로 깊게 판정합니다.
+낮은 비용의 header/CORS/static 후보만 반복하지 않도록 P1/P2/P3/P4 priority를 모두 coverage에
+넣고, SQLi/NoSQLi, server-side injection, XSS,
+SSRF, auth bypass/account takeover, IDOR/BOLA/BFLA, path traversal/XXE/deserialization,
+cloud secret exposure, business logic 같은 reportable 가능 class를 명시적으로 배정합니다.
+Bugcrowd VRT JSON이 설정되어 있으면 advisor/worker는 최상위 카테고리와 P1/P2/P3/P4 대표 variant
+요약을 보고, 산출물에 VRT coverage ledger를 남깁니다.
 
 worker 결과는 반드시 상태값으로 끝납니다.
 
@@ -581,14 +589,19 @@ blocker를 제거하지 않는 한 다시 배정하지 않습니다. `report-rea
 Bug bounty lane 예시:
 
 ```text
-auth/session/account boundary
+server-side injection/SQLi/command
+client-side injection/XSS
 access-control/API object boundary
-input-handling/injection/XSS
+auth/session/account takeover
+SSRF/cloud/internal metadata
+file/path/XXE/deserialization
+CSRF/clickjacking/state change
 redirect/deep-link/linking
 cache/CORS/header/static exposure
 upload/media/file-processing
 mobile/app-link/API client surface
 business-logic/state transition
+third-party/components/secrets
 ```
 
 ## 실행 후 대화로 정하기

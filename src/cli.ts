@@ -530,8 +530,11 @@ function appendPaneSnapshot(label: string, output: string, separated: boolean): 
   const count = (paneSnapshotCounts.get(label) ?? 0) + 1;
   paneSnapshotCounts.set(label, count);
   const divider = `\n── ${label} #${count} 갱신 ${clockTime()} ──\n`;
-  void separated;
-  process.stdout.write(`${divider}${output.trimEnd()}\n`);
+  if (process.env.HUNTCTL_PANE_HISTORY === "1") {
+    process.stdout.write(`${separated ? divider : ""}${output.trimEnd()}\n`);
+    return;
+  }
+  process.stdout.write(`\x1b[H\x1b[2J\x1b[3J${divider.trimStart()}${output.trimEnd()}\n`);
 }
 
 function clockTime(date = new Date()): string {

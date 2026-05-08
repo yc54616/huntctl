@@ -80,7 +80,7 @@ export function buildInitialTaskPrompt(runbook: Runbook, agent: AgentConfig): st
   if (runbook.profile === "ctf") {
     return `Analyze the CTF challenge as ${agent.role}. Optimize for reaching the flag quickly: identify the smallest decisive checks, useful artifacts, likely category, first solve hypothesis, and the exact pivot point if that hypothesis produces no signal.`;
   }
-  return `Work as ${agent.role} for this authorized bug bounty target. Pick or support the highest-signal in-scope candidate, deep-dive for reproducible attacker capability, concrete impact, PoC evidence, and reportability. Maintain a candidate ledger and rotate stale lanes so the run does not repeat the same space.`;
+  return `Work as ${agent.role} for this authorized bug bounty target. Cover the VRT/weakness space evenly, but switch to depth mode immediately when a plausible high-impact lead appears. Pick or support the highest-signal in-scope candidate, deep-dive for reproducible attacker capability, concrete impact, PoC evidence, and reportability. Maintain candidate and VRT coverage ledgers so the run does not repeat the same space.`;
 }
 
 export async function buildAdvisorPrompt(params: {
@@ -92,7 +92,7 @@ export async function buildAdvisorPrompt(params: {
     params.runbook.profile === "ctf"
       ? ctfContext(params.runbook)
       : bountyContext(params.runbook, "advisor", params.state.runbookPath);
-  const taxonomy = taxonomyReferenceContext(params.runbook);
+  const taxonomy = (await taxonomyContext(params.runbook)) || taxonomyReferenceContext(params.runbook);
   return [
     "huntctl cacheable advisor prompt prefix v2",
     "You are the huntctl advisor agent.",
@@ -402,7 +402,7 @@ function workerContextPlan(runbook: Runbook, role: string): { inlineTaxonomy: bo
     };
   }
   return {
-    inlineTaxonomy: roleNeedsValidationContext(role) || roleNeedsReportContext(role),
+    inlineTaxonomy: roleNeedsDiscoveryContext(role) || roleNeedsValidationContext(role) || roleNeedsReportContext(role),
     inlineReportTemplate: roleNeedsReportContext(role)
   };
 }
@@ -427,6 +427,11 @@ function contextLoadingRules(runbook: Runbook, role: string, runbookPath?: strin
 function roleNeedsValidationContext(role: string): boolean {
   const value = role.toLowerCase();
   return value.includes("validator") || value.includes("triage") || value.includes("evidence");
+}
+
+function roleNeedsDiscoveryContext(role: string): boolean {
+  const value = role.toLowerCase();
+  return value.includes("recon") || value.includes("endpoint") || value.includes("mapper") || value.includes("custom");
 }
 
 function roleNeedsReportContext(role: string): boolean {
@@ -461,12 +466,17 @@ function profileSearchStrategyRules(runbook: Runbook, role?: string): string[] {
   }
   return [
     "- Bug bounty usually has no single answer. Pick the highest-signal in-scope candidate and deep-dive until it becomes report-ready, keep-worthy, blocked, rejected, or ready to rotate.",
+    "- Cover the VRT/weakness space evenly over time. Do not spend the whole run on only easy header, CORS, redirect, or public metadata findings.",
+    "- Include all Bugcrowd VRT priorities P1, P2, P3, and P4 in coverage planning and the coverage ledger. Do not let P3 or P4 disappear from the sweep; depth priority is based on reportable signal, not only numeric priority.",
+    "- High-impact classes must get explicit cycles: SQLi/NoSQLi, server-side injection, XSS, SSRF, auth bypass/account takeover, IDOR/BOLA/BFLA, path traversal/XXE/deserialization, cloud secret exposure, and business logic.",
+    "- When a high-impact lead looks plausible, switch from sweep mode to depth mode immediately: produce a minimal reproducible PoC, request/response evidence, attacker capability, concrete impact, and a clear report-ready/keep/reject decision.",
+    "- Keep a compact VRT coverage ledger: category/lane, asset or endpoint checked, evidence path, status, and next category to cover. Use it to avoid repeatedly checking the same weak class.",
     "- Do not pivot just because the first request is inconclusive. Tighten reproduction, collect request/response evidence, test preconditions, and prove or disprove attacker capability and concrete impact.",
     "- Avoid staying in the same space indefinitely. Track a candidate ledger with candidate id, asset/surface lane, vulnerability class, status, evidence added, missing proof, and next decision.",
     "- Use a depth budget per lane: spend a few focused cycles on reproduction and impact, but if two consecutive cycles add no new evidence or capability, pivot to an adjacent asset/surface/vulnerability lane.",
     "- Pivot only after writing a clear rejection reason, scope reason, missing-permission blocker, or evidence gap that makes more work on this candidate inefficient.",
     "- When multiple workers are available, coordinate around one primary candidate only while another worker keeps a light alternate lane alive so the run does not tunnel.",
-    "- Prefer lane rotation over shallow scanning: auth/session, access control/IDOR, API parameter behavior, redirects/deep links, cache/CORS/headers, uploads/media, mobile/app links, cloud/static assets, business logic.",
+    "- Prefer balanced lane rotation plus depth-on-signal: server-side injection/SQLi, client-side injection/XSS, auth/session/account takeover, access control/IDOR, SSRF/cloud/internal metadata, file/path/XXE/deserialization, CSRF/state change, redirects/deep links, uploads/media, mobile/app links, cloud/static assets, business logic.",
     role === "report-writer"
       ? "- Report-writing should maintain normalized candidate status: report-ready, keep, blocked, reject, pivot-adjacent, or rotate-lane, with exact evidence gaps."
       : "- Worker output must name the candidate under test, current lane, current confidence, evidence added, and whether to keep digging, pivot adjacent, or rotate to a different lane."

@@ -259,6 +259,13 @@ agents:
       assert.equal(advisorTasks.length > 0, true);
       assert.equal(advisorTasks.some((task) => task.agentId === "recon-1" || task.agentId === "validator-2"), true);
       assert.equal(advisorTasks.some((task) => task.prompt.includes("이번 작업 lane")), true);
+      assert.equal(advisorTasks.some((task) => task.prompt.includes("관련 VRT/weakness")), true);
+      assert.equal(
+        advisorTasks.some(
+          (task) => task.prompt.includes("server-side injection/SQLi/command") || task.prompt.includes("client-side injection/XSS")
+        ),
+        true
+      );
       assert.equal(advisorTasks.some((task) => task.prompt.includes("candidate ledger")), true);
       assert.equal(advisorTasks.some((task) => task.prompt.includes("Decision: report-ready | keep | blocked | reject | pivot-adjacent | rotate-lane")), true);
       assert.equal(state.status, "running");
@@ -478,6 +485,8 @@ describe("prompt caching layout", () => {
     assert.match(bountyPrompt, /candidate ledger/i);
     assert.match(bountyPrompt, /depth budget/i);
     assert.match(bountyPrompt, /lane rotation/i);
+    assert.match(bountyPrompt, /SQLi\/NoSQLi/i);
+    assert.match(bountyPrompt, /SSRF/i);
     assert.match(bountyPrompt, /Decision: report-ready \| keep \| blocked \| reject \| pivot-adjacent \| rotate-lane/i);
     assert.match(bountyPrompt, /blocked.*user-provided authorization/i);
   });
@@ -539,5 +548,56 @@ describe("prompt caching layout", () => {
     assert.match(reconPrompt, /report-template\.md/);
     assert.match(reconPrompt, /\.\.\. \+30 more in runbook/);
     assert.match(reportPrompt, /UNIQUE_REPORT_TEMPLATE_SENTINEL/);
+  });
+
+  it("includes compact VRT coverage context in recon prompts", async () => {
+    const runbook: Runbook = {
+      profile: "bug-bounty",
+      target: {
+        name: "example",
+        scope: ["https://app.example.com"],
+        out_of_scope: []
+      },
+      program: {
+        description: "authorized",
+        platform: "bugcrowd",
+        bugcrowd_vrt_path: path.resolve("vulnerability-rating-taxonomy.json"),
+        vrt: [],
+        weaknesses: [],
+        rules: {}
+      },
+      advisor: {
+        mode: "manual",
+        interval_seconds: 45,
+        can_assign_workers: true,
+        can_stop_workers: true
+      },
+      limits: {
+        max_parallel_agents: 2,
+        timeout_minutes: 45
+      },
+      agents: [
+        { id: "advisor", role: "advisor" },
+        { id: "recon-1", role: "recon" }
+      ],
+      evidence_dir: ".huntctl/evidence",
+      sandbox: {
+        mode: "host"
+      }
+    };
+
+    const prompt = await buildWorkerPrompt({
+      runbook,
+      agent: { id: "recon-1", role: "recon" },
+      taskPrompt: "cover VRT lanes"
+    });
+
+    assert.match(prompt, /Bugcrowd VRT top-level categories/);
+    assert.match(prompt, /Broken Access Control/);
+    assert.match(prompt, /P1:/);
+    assert.match(prompt, /P2:/);
+    assert.match(prompt, /P3:/);
+    assert.match(prompt, /P4:/);
+    assert.match(prompt, /Coverage rule/);
   });
 });

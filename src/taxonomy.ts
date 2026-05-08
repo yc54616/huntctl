@@ -57,13 +57,19 @@ async function bugcrowdVrtSummary(filePath: string): Promise<string> {
   try {
     const raw = await readFile(filePath, "utf8");
     const parsed = JSON.parse(raw) as { metadata?: { release_date?: string }; content?: VrtNode[] };
-    const categories = (parsed.content ?? []).map((node) => node.name).filter(Boolean).slice(0, 20);
-    const examples = collectVariantExamples(parsed.content ?? [], 12);
+    const categories = (parsed.content ?? []).map((node) => node.name).filter(Boolean);
+    const priorityExamples = priorityVariantExamples(parsed.content ?? [], [1, 2, 3, 4], 8);
+    const fallbackExamples = collectVariantExamples(parsed.content ?? [], 16);
     return [
       `Bugcrowd VRT file: ${filePath}`,
       `Bugcrowd VRT release: ${parsed.metadata?.release_date ?? "unknown"}`,
-      `Bugcrowd VRT categories: ${categories.join(", ")}`,
-      examples.length ? `Bugcrowd VRT examples: ${examples.join("; ")}` : ""
+      `Bugcrowd VRT top-level categories (${categories.length}): ${categories.join(", ")}`,
+      priorityExamples.length
+        ? `Bugcrowd VRT priority coverage examples: ${priorityExamples.join(" | ")}`
+        : fallbackExamples.length
+          ? `Bugcrowd VRT examples to include in coverage planning: ${fallbackExamples.join("; ")}`
+          : "",
+      "Coverage rule: include P1, P2, P3, and P4 in the VRT coverage ledger; switch to depth mode immediately when any priority produces a plausible reportable lead."
     ]
       .filter(Boolean)
       .join("\n");
@@ -72,16 +78,30 @@ async function bugcrowdVrtSummary(filePath: string): Promise<string> {
   }
 }
 
-function collectVariantExamples(nodes: VrtNode[], limit: number, prefix: string[] = []): string[] {
+function priorityVariantExamples(nodes: VrtNode[], priorities: number[], perPriority: number): string[] {
+  return priorities
+    .map((priority) => {
+      const examples = collectVariantExamples(nodes, perPriority, [], (node) => node.priority === priority);
+      return examples.length ? `P${priority}: ${examples.join("; ")}` : `P${priority}: no examples found`;
+    })
+    .filter(Boolean);
+}
+
+function collectVariantExamples(
+  nodes: VrtNode[],
+  limit: number,
+  prefix: string[] = [],
+  predicate: (node: VrtNode) => boolean = () => true
+): string[] {
   const output: string[] = [];
   for (const node of nodes) {
     const path = [...prefix, node.name ?? node.id ?? "unknown"];
-    if (node.type === "variant") {
+    if (node.type === "variant" && predicate(node)) {
       output.push(`${path.join(" > ")}${node.priority ? ` (P${node.priority})` : ""}`);
     }
     if (output.length >= limit) break;
     if (node.children) {
-      output.push(...collectVariantExamples(node.children, limit - output.length, path));
+      output.push(...collectVariantExamples(node.children, limit - output.length, path, predicate));
     }
     if (output.length >= limit) break;
   }

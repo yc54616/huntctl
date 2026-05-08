@@ -17,16 +17,16 @@ import {
   updateState,
   workerAgents
 } from "./store.js";
-import type { AgentConfig, AdvisorDecision, BountyLane, HuntEvent, RunState, Runbook, TaskState } from "./types.js";
+import type { AgentConfig, AdvisorDecision, BountyLane, Candidate, HuntEvent, RunState, Runbook, TaskState } from "./types.js";
 import { buildAdvisorPrompt, buildInitialTaskPrompt, buildWorkerPrompt, parseAdvisorDecision, parseCandidateUpdates } from "./prompts.js";
 import { applyPolicyWarningsToPrompt, evaluateTaskPolicy } from "./policy.js";
-import type { Candidate } from "./types.js";
 import { internalCommandArgs, nowIso, pathExists, safeDockerName, truncate, writeJson } from "./utils.js";
 import { runCodexTask } from "./codex.js";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const DEFAULT_ADVISOR_DEBOUNCE_MS = 30_000;
+const DEFAULT_COORDINATOR_POLL_MS = 5_000;
 
 export async function startRun(params: {
   runbookPath: string;
@@ -255,6 +255,7 @@ export async function runWorkerTask(params: { runDir: string; taskId: string }):
       next.tasks[task.id].status = "blocked";
       next.tasks[task.id].blockedReason = policy.reason;
       next.agents[agent.id].status = "blocked";
+      next.agents[agent.id].currentTaskId = undefined;
       next.agents[agent.id].lastMessage = policy.reason;
       next.heldTasks.push(`${task.id}: ${policy.reason}`);
     });
@@ -300,6 +301,7 @@ export async function runWorkerTask(params: { runDir: string; taskId: string }):
       next.tasks[task.id].lastMessage = truncate(result.finalMessage || "No final message", 1000);
       next.agents[agent.id].status = done ? "done" : "failed";
       next.agents[agent.id].pid = undefined;
+      next.agents[agent.id].currentTaskId = undefined;
       next.agents[agent.id].lastUpdate = nowIso();
       next.agents[agent.id].lastMessage = truncate(result.finalMessage || "No final message", 1000);
       next.agents[agent.id].taskCount += 1;
@@ -340,6 +342,7 @@ export async function runWorkerTask(params: { runDir: string; taskId: string }):
       next.tasks[task.id].lastMessage = message;
       next.agents[agent.id].status = "failed";
       next.agents[agent.id].pid = undefined;
+      next.agents[agent.id].currentTaskId = undefined;
       next.agents[agent.id].lastMessage = message;
       next.errors.push(message);
     });
@@ -387,7 +390,7 @@ export async function runAdvisorLoop(params: { runDir: string; once?: boolean; c
     if (params.once || (!params.continuous && runbook.advisor.mode !== "auto")) break;
     const after = await readState(params.runDir);
     if (!params.continuous && allTasksTerminal(after)) break;
-    await new Promise((resolve) => setTimeout(resolve, runbook.advisor.interval_seconds * 1000));
+    await new Promise((resolve) => setTimeout(resolve, coordinatorPollMs(runbook, Boolean(params.continuous))));
   }
 
   await updateState(params.runDir, (state) => {
@@ -669,16 +672,24 @@ async function runAdvisorOnce(runDir: string, runbook: Runbook): Promise<void> {
 }
 
 async function shouldRunAdvisorCycle(runDir: string, runbook: Runbook, state: RunState): Promise<boolean> {
-  void runbook;
   if (!state.advisor.lastRunAt) return true;
   const delta = await advisorDeltaEvents(runDir, state);
   if (!delta.length) return false;
   if (delta.some(isUrgentAdvisorEvent)) return true;
+  if (delta.some(isWorkerCompletionEvent) && hasAvailableAutoWorker(runbook, state)) return true;
   return elapsedSince(state.advisor.lastRunAt) >= advisorDebounceMs();
 }
 
 function isUrgentAdvisorEvent(event: HuntEvent): boolean {
   return event.type === "user.ask" || event.type === "scope.updated" || event.type === "target.stopped";
+}
+
+function isWorkerCompletionEvent(event: HuntEvent): boolean {
+  return event.type === "task.done" || event.type === "task.failed" || event.type === "task.blocked" || event.type === "candidate.updated";
+}
+
+function hasAvailableAutoWorker(runbook: Runbook, state: RunState): boolean {
+  return workerAgents(runbook.agents).some((agent) => isWorkerAvailableForAutoAssign(state, agent.id) && !hasPendingTaskForAgent(state, agent.id));
 }
 
 function elapsedSince(iso?: string): number {
@@ -693,6 +704,16 @@ function advisorDebounceMs(): number {
   const parsed = Number(raw);
   if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_ADVISOR_DEBOUNCE_MS;
   return parsed;
+}
+
+function coordinatorPollMs(runbook: Runbook, continuous: boolean): number {
+  const raw = process.env.HUNTCTL_COORDINATOR_POLL_MS;
+  if (raw) {
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed >= 500) return parsed;
+  }
+  const configured = runbook.advisor.interval_seconds * 1000;
+  return continuous ? Math.min(configured, DEFAULT_COORDINATOR_POLL_MS) : configured;
 }
 
 async function advisorDeltaEvents(runDir: string, state: RunState): Promise<HuntEvent[]> {
@@ -833,10 +854,21 @@ function bountyFallbackTask(runbook: Runbook, state: RunState, worker: AgentConf
   const platform = runbook.program?.platform ?? "custom";
   const evidence = runbook.evidence_dir;
   const lanePlan = selectBountyLanePlan(runbook, state, worker, round);
+  const promising = selectPromisingCandidate(state);
+  const shouldDeepen = Boolean(promising && roleShouldDeepenCandidate(worker.role));
+  const focusCandidate = shouldDeepen ? promising : undefined;
+  const mode = focusCandidate
+    ? `이번 작업은 VRT 균등 sweep보다 주력 candidate 심화가 우선입니다. candidate=${focusCandidate.id}, status=${focusCandidate.status}, lane=${focusCandidate.lane ?? "unknown"}, class=${focusCandidate.vulnClass ?? "unknown"}. `
+    : "이번 작업은 VRT/weakness lane을 골고루 커버하는 sweep입니다. 이미 본 쉬운 header/CORS/static 후보만 반복하지 말고 아직 덜 본 P1/P2/P3/P4 category와 class를 확인하세요. ";
+  const vrt = lanePlan.lane.vrt?.length ? `관련 VRT/weakness: ${lanePlan.lane.vrt.join(", ")}. ` : "";
   const base =
     `자동 라운드 ${round}. 현재 runbook 목표 정보와 기존 ${evidence} 산출물을 기준으로 진행하세요. ` +
     `이번 작업 lane은 "${lanePlan.lane.label}"입니다. 인접 전환 lane은 "${lanePlan.next.label}"입니다. ` +
+    mode +
+    vrt +
     `lane 목표: ${lanePlan.lane.goal} ` +
+    "P1/P2/P3/P4 VRT priority를 모두 coverage ledger에 포함하되, SQLi/NoSQLi, server-side injection, XSS, SSRF, auth bypass, IDOR/BOLA, file/path traversal, deserialization, cloud secret exposure, account takeover 계열은 낮은 비용의 재현 가능한 PoC로 우선 확인하세요. " +
+    "단순 header, 공개 metadata, scanner-only 결과는 report-ready 후보가 아니며, 같은 쉬운 표면을 반복하지 마세요. " +
     "반드시 마지막 줄에 `Decision: report-ready | keep | blocked | reject | pivot-adjacent | rotate-lane` 중 하나를 정확히 쓰세요. " +
     "`report-ready`는 in-scope asset, attacker capability, concrete impact, 재현 절차, PoC request/code, durable evidence path, taxonomy/severity mapping이 모두 있을 때만 허용됩니다. " +
     "`keep`은 이번 cycle에서 capability/impact/repro/PoC 품질을 직접 높이는 새 증거가 생겼을 때만 허용됩니다. " +
@@ -844,6 +876,7 @@ function bountyFallbackTask(runbook: Runbook, state: RunState, worker: AgentConf
     "`reject`는 공개 metadata, scanner/header-only, escaped reflection, error-body-only CORS, 정상 redirect, 공격자-controlled 보안 경계 침범 없음일 때 쓰세요. " +
     "`pivot-adjacent`는 가까운 asset/surface/class에 구체적 다음 테스트가 있을 때, `rotate-lane`은 같은 lane에서 2회 연속 새 evidence/capability가 없을 때 쓰세요. " +
     "보고 가능성을 확인하려면 attacker capability, 구체적 영향, 재현 절차, PoC 코드 또는 HTTP 요청, 증거 파일 경로를 반드시 남기세요. " +
+    "VRT coverage ledger를 HUNTCTL_ARTIFACTS 또는 HUNTCTL_EVIDENCE_DIR에 갱신해 어떤 category/lane을 확인했고 다음에 무엇을 볼지 남기세요. " +
     "버그바운티는 한 고신호 후보를 충분히 깊게 파는 것이 우선이지만, 같은 lane에서 2회 연속 새 evidence/capability가 없으면 candidate ledger에 blocked/reject/pivot-adjacent/rotate-lane 사유를 남기고 인접 lane으로 전환하세요. " +
     "candidate ledger에는 candidate id, asset/surface lane, vuln class, normalized status(report-ready/keep/blocked/reject/pivot-adjacent/rotate-lane), evidence added, missing proof, next decision을 남기세요. " +
     "결과에는 `Why continue`와 `Why stop/rotate`를 모두 포함하고, reportable 여부, 불확실성, 다음 배정 후보를 한국어로 남기세요.";
@@ -907,29 +940,65 @@ function bountyFallbackTask(runbook: Runbook, state: RunState, worker: AgentConf
 
 const DEFAULT_BOUNTY_LANES: BountyLane[] = [
   {
-    label: "auth/session/account boundary",
-    goal: "로그인/세션/계정 경계에서 공격자가 권한 없는 데이터나 action에 도달할 수 있는지 확인",
-    recon: "auth/session 흐름, redirect after login, cookie flags, account edge를 중심으로 보세요.",
-    validator: "인증 전/후 차이, test account 경계, 세션 고정/혼동, 권한 없는 action 가능성을 검증하세요.",
-    report: "계정 전제조건, 테스트 계정, 세션 상태, 영향받는 사용자/데이터를 보고서 필드에 맞게 정리하세요."
+    label: "server-side injection/SQLi/command",
+    goal: "SQLi/NoSQLi/LDAP/template/command injection이 데이터 접근, 인증 우회, RCE 같은 높은 영향으로 이어지는지 확인",
+    vrt: ["Server-Side Injection", "SQL Injection", "NoSQL Injection", "OS Command Injection", "Server-Side Template Injection"],
+    recon: "파라미터, JSON body, GraphQL variables, 검색/필터/sort, legacy endpoint, 에러/타이밍/타입 차이가 있는 입력점을 찾으세요.",
+    validator: "무해한 canary, boolean/differential, syntax-safe payload, response class 차이를 낮은 요청 수로 확인하고 데이터/권한/RCE 영향 가능성을 분리하세요.",
+    report: "payload, affected parameter, request/response diff, DB/object 영향, 재현 조건, VRT severity 근거를 정리하세요."
+  },
+  {
+    label: "client-side injection/XSS",
+    goal: "reflected/stored/DOM XSS 또는 client-side injection이 실제 스크립트 실행, 세션/계정 영향, 사용자 데이터 접근으로 이어지는지 확인",
+    vrt: ["Cross-Site Scripting (XSS)", "Client-Side Injection", "Content Spoofing"],
+    recon: "검색, redirect, markdown/html rendering, profile/content fields, postMessage, URL fragment/query sink, CSP 우회 후보를 찾으세요.",
+    validator: "무해한 canary와 브라우저/DOM sink 증거를 확인하고, escaping만 있거나 실행/영향이 없으면 제외하세요.",
+    report: "payload, sink, browser evidence, affected user action, account/session/data impact, screenshot/video 경로를 정리하세요."
   },
   {
     label: "access-control/API object boundary",
-    goal: "API/객체 식별자/권한 경계에서 IDOR/BOLA/BFLA 가능성을 확인",
-    recon: "API endpoint, object id, tenant/account 파라미터, GraphQL/REST route를 중심으로 보세요.",
-    validator: "객체 id/role/account 차이로 읽기/쓰기/상태 변경이 가능한지 최소 요청으로 검증하세요.",
-    report: "대상 객체, 권한 모델, 재현 계정 조합, 허용/비허용 응답 차이를 정리하세요."
+    goal: "API/객체 식별자/권한 경계에서 IDOR/BOLA/BFLA로 권한 없는 읽기/쓰기/상태 변경이 가능한지 확인",
+    vrt: ["Broken Access Control (BAC)", "IDOR", "BOLA", "BFLA", "Privilege Escalation"],
+    recon: "API endpoint, object id, tenant/account/org/project 파라미터, GraphQL/REST route, role-gated action을 중심으로 보세요.",
+    validator: "객체 id/role/account 차이로 읽기/쓰기/상태 변경이 가능한지 최소 요청으로 검증하고 허용/비허용 응답 차이를 저장하세요.",
+    report: "대상 객체, 권한 모델, 재현 계정 조합, 허용/비허용 응답 차이, 공격자가 얻는 데이터/action을 정리하세요."
   },
   {
-    label: "input-handling/injection/XSS",
-    goal: "입력 반영/파싱/템플릿/검색/필터 경계에서 실행 또는 데이터 접근 영향 확인",
-    recon: "파라미터, 검색, JSON body, markdown/html 렌더링, 에러 반응이 있는 endpoint를 찾으세요.",
-    validator: "무해한 canary와 reflection/sink/encoding 차이를 확인하고, 실행/권한/데이터 영향이 없으면 제외하세요.",
-    report: "payload, sink, 브라우저/계정 조건, 실행 증거와 영향 범위를 정리하세요."
+    label: "auth/session/account takeover",
+    goal: "로그인/세션/계정 복구/OAuth 경계에서 account takeover, auth bypass, session fixation/confusion 가능성을 확인",
+    vrt: ["Broken Authentication and Session Management", "Account Takeover", "OAuth Misconfiguration", "Session Fixation"],
+    recon: "login/signup/reset/MFA/OAuth/social callback, session cookie, remember-me, device trust, redirect after login 흐름을 모으세요.",
+    validator: "인증 전/후 차이, test account 경계, 세션 고정/혼동, token/code leakage, 권한 없는 action 가능성을 검증하세요.",
+    report: "계정 전제조건, 테스트 계정, 세션 상태, 영향받는 사용자/데이터를 보고서 필드에 맞게 정리하세요."
+  },
+  {
+    label: "SSRF/cloud/internal metadata",
+    goal: "URL fetch/import/webhook/proxy/image 처리에서 SSRF, internal access, cloud metadata/secret exposure 가능성을 확인",
+    vrt: ["Server-Side Request Forgery (SSRF)", "Cloud Security", "Sensitive Data Exposure", "Server Security Misconfiguration"],
+    recon: "url, callback, webhook, avatar/import, PDF/image fetch, proxy, integration endpoint와 outbound fetch 흔적을 찾으세요.",
+    validator: "허용된 canary URL, redirect chain, DNS/HTTP interaction evidence로 서버-side fetch 여부를 확인하고 내부/metadata 영향 가능성을 분리하세요.",
+    report: "fetch endpoint, canary evidence, reachable target class, cloud/internal impact, 제한사항과 안전한 PoC를 정리하세요."
+  },
+  {
+    label: "file/path/XXE/deserialization",
+    goal: "파일 읽기/경로 처리/XML/parser/archive/deserialization에서 LFI/RFI/path traversal/XXE/RCE 가능성을 확인",
+    vrt: ["Server-Side Injection", "XML External Entity (XXE)", "Insecure Deserialization", "Path Traversal", "Arbitrary File Read"],
+    recon: "file/path/template/export/import/archive/XML/parser 파라미터, download/view endpoints, attachment transforms를 찾으세요.",
+    validator: "비파괴 canary 파일명/경로/파서 반응 차이와 안전한 request diff로 읽기/실행/정보노출 가능성을 확인하세요.",
+    report: "입력점, payload, response diff, 읽힌 데이터/실행 영향, PoC request와 증거 경로를 정리하세요."
+  },
+  {
+    label: "CSRF/clickjacking/state change",
+    goal: "상태 변경 action이 CSRF/clickjacking/사용자 상호작용 취약점으로 실제 계정 변경이나 권한 변화로 이어지는지 확인",
+    vrt: ["Cross-Site Request Forgery (CSRF)", "Clickjacking", "Broken Access Control (BAC)"],
+    recon: "POST/PUT/DELETE, logout, email/phone/password/profile/security setting 변경, CORS/preflight/cookie SameSite 흐름을 찾으세요.",
+    validator: "허용된 계정/fixture에서 token/SameSite/origin 검증과 before/after 상태를 확인하고 단순 logout 등 낮은 영향은 분리하세요.",
+    report: "상태 변경 action, precondition, PoC form/request, before/after evidence, 사용자 impact를 정리하세요."
   },
   {
     label: "redirect/deep-link/linking",
     goal: "redirect, AASA/assetlinks, app link, OAuth return URL이 실제 account takeover/phishing/data impact로 이어지는지 확인",
+    vrt: ["Unvalidated Redirects and Forwards", "OAuth Misconfiguration", "Mobile Security Misconfiguration"],
     recon: "redirect parameter, app/deep link metadata, OAuth/social login callback, AASA/assetlinks를 모으세요.",
     validator: "단순 open redirect인지, token/code/session/user action 탈취 가능성까지 이어지는지 분리 검증하세요.",
     report: "redirect chain, precondition, token/code 노출 여부, 사용자 상호작용과 실제 impact를 정리하세요."
@@ -937,6 +1006,7 @@ const DEFAULT_BOUNTY_LANES: BountyLane[] = [
   {
     label: "cache/CORS/header/static exposure",
     goal: "캐시/헤더/CORS/static artifact가 민감정보 노출이나 권한 우회로 이어지는지 확인",
+    vrt: ["Sensitive Data Exposure", "Server Security Misconfiguration", "Cloud Security", "CORS Misconfiguration"],
     recon: "cache-control, vary, CORS, CSP, security headers, static JS/map/config/backup 파일을 중심으로 보세요.",
     validator: "민감 데이터, authenticated response caching, origin credential exposure가 재현되는지 확인하세요.",
     report: "민감도, 노출 조건, 요청/응답 헤더, 브라우저/프록시 재현 가능성을 정리하세요."
@@ -944,6 +1014,7 @@ const DEFAULT_BOUNTY_LANES: BountyLane[] = [
   {
     label: "upload/media/file-processing",
     goal: "업로드/미디어/파일 처리에서 stored impact, parsing bug, metadata leak, access control 문제가 있는지 확인",
+    vrt: ["Unrestricted File Upload", "Stored XSS", "Server-Side Injection", "Sensitive Data Exposure"],
     recon: "upload endpoint, media transform, attachment serving, file metadata, CDN/object URL을 찾으세요.",
     validator: "파일 타입/metadata/visibility/serving policy가 공격자 capability로 이어지는지 비파괴적으로 검증하세요.",
     report: "파일 샘플, 업로드 계정, 표시/다운로드 URL, 변환 결과와 영향 범위를 정리하세요."
@@ -951,6 +1022,7 @@ const DEFAULT_BOUNTY_LANES: BountyLane[] = [
   {
     label: "mobile/app-link/API client surface",
     goal: "모바일 앱/API client metadata에서 hidden endpoint, weak link, token/storage impact를 확인",
+    vrt: ["Mobile Security Misconfiguration", "Insecure Data Storage", "Insecure Data Transport", "Broken Authentication and Session Management"],
     recon: "APK/manifest/deep link/API host/certificate pinning hints/client config를 중심으로 보세요.",
     validator: "앱 링크/토큰/hidden endpoint가 실제 서버 side impact로 이어지는지 확인하고 단순 노출이면 제외하세요.",
     report: "앱 버전, manifest/API evidence, 서버 재현 요청, 영향 가능성과 한계를 정리하세요."
@@ -958,9 +1030,18 @@ const DEFAULT_BOUNTY_LANES: BountyLane[] = [
   {
     label: "business-logic/state transition",
     goal: "결제/구독/쿠폰/상태 전이/초대/권한 변경에서 실제 이득이나 권한 상승이 가능한지 확인",
+    vrt: ["Business Logic Errors", "Broken Access Control (BAC)", "Privilege Escalation", "Race Condition"],
     recon: "상태 변경 endpoint, 가격/쿠폰/tax/구독/초대/role workflow를 inventory하세요.",
     validator: "허용된 테스트 조건 안에서 상태 전이, replay, race-free logic flaw가 재현되는지 확인하세요.",
     report: "비즈니스 impact, 계정/결제 전제조건, 재현 순서, 제한사항을 정리하세요."
+  },
+  {
+    label: "third-party/components/secrets",
+    goal: "의존성/서드파티/공개 secret/config 노출이 계정/데이터 접근 또는 공급망 영향으로 이어지는지 확인",
+    vrt: ["Using Components with Known Vulnerabilities", "Sensitive Data Exposure", "Cloud Security", "Server Security Misconfiguration"],
+    recon: "JS bundles, source maps, package versions, exposed keys, third-party integrations, CI/CD or cloud config 흔적을 찾으세요.",
+    validator: "키 권한/민감도/실제 접근 가능성을 안전하게 확인하고 public-only/test-only/expired secret은 제외하세요.",
+    report: "노출 위치, secret/component, 권한 범위, 재현 evidence, rotation/remediation을 정리하세요."
   }
 ];
 
@@ -971,15 +1052,124 @@ function selectBountyLanePlan(
   round: number
 ): { lane: BountyLane; next: BountyLane } {
   const lanes = runbook.bounty_lanes && runbook.bounty_lanes.length ? runbook.bounty_lanes : DEFAULT_BOUNTY_LANES;
-  const completedAdvisorTasks = Object.values(state.tasks).filter(
-    (task) => task.source === "advisor" && ["done", "failed", "blocked"].includes(task.status)
-  ).length;
-  const roleOffset = worker.role === "validator" ? 2 : worker.role === "report-writer" || worker.role === "evidence" ? 4 : 0;
-  const index = (completedAdvisorTasks + round + roleOffset) % lanes.length;
+  const promising = selectPromisingCandidate(state);
+  const candidateLane = promising && roleShouldDeepenCandidate(worker.role) ? laneForCandidate(lanes, promising) : undefined;
+  if (candidateLane) {
+    const index = lanes.indexOf(candidateLane);
+    return {
+      lane: candidateLane,
+      next: lanes[(index + 1) % lanes.length]
+    };
+  }
+  const roleOffset = roleLaneOffset(worker.role);
+  const laneStats = bountyLaneStats(state);
+  const scored = lanes
+    .map((lane, index) => {
+      const stats = laneStats.get(lane.label) ?? { total: 0, active: 0, recent: 0 };
+      const highImpactBonus = isHighImpactLane(lane) ? -6 : 0;
+      const roleTieBreak = ((index - roleOffset + lanes.length) % lanes.length) / 100;
+      const roundTieBreak = ((index + round) % lanes.length) / 1000;
+      return {
+        index,
+        score: stats.total * 10 + stats.active * 30 + stats.recent * 5 + highImpactBonus + roleTieBreak + roundTieBreak
+      };
+    })
+    .sort((left, right) => left.score - right.score || left.index - right.index);
+  const index = scored[0]?.index ?? 0;
   return {
     lane: lanes[index],
     next: lanes[(index + 1) % lanes.length]
   };
+}
+
+function selectPromisingCandidate(state: RunState): Candidate | undefined {
+  return Object.values(state.candidates ?? {})
+    .filter((candidate) => candidate.status === "report-ready" || candidate.status === "keep")
+    .filter((candidate) => candidate.id !== "candidate-ledger-current")
+    .filter((candidate) => candidate.capability || candidate.impact || candidate.evidenceRefs.length)
+    .sort((left, right) => {
+      const statusScore = (candidateStatusPriority(left) - candidateStatusPriority(right));
+      if (statusScore !== 0) return statusScore;
+      return right.lastDecisionAt.localeCompare(left.lastDecisionAt);
+    })[0];
+}
+
+function candidateStatusPriority(candidate: Candidate): number {
+  if (candidate.status === "report-ready") return 0;
+  if (candidate.status === "keep") return 1;
+  return 2;
+}
+
+function roleShouldDeepenCandidate(role: string): boolean {
+  const value = role.toLowerCase();
+  return value.includes("validator") || value.includes("report") || value.includes("evidence") || value.includes("custom");
+}
+
+function laneForCandidate(lanes: BountyLane[], candidate: Candidate): BountyLane | undefined {
+  const text = `${candidate.lane ?? ""} ${candidate.vulnClass ?? ""} ${candidate.id}`.toLowerCase();
+  return (
+    lanes.find((lane) => lane.label.toLowerCase() === candidate.lane?.toLowerCase()) ??
+    lanes.find((lane) => lane.label.toLowerCase().includes(candidate.lane?.toLowerCase() ?? "\u0000")) ??
+    lanes.find((lane) => candidateMatchesLane(text, lane))
+  );
+}
+
+function candidateMatchesLane(candidateText: string, lane: BountyLane): boolean {
+  const label = lane.label.toLowerCase();
+  const vrt = (lane.vrt ?? []).join(" ").toLowerCase();
+  if (/(sqli|nosql|injection|ssti|command)/.test(candidateText)) return /injection|sqli|command/.test(label + vrt);
+  if (/(xss|dom|client)/.test(candidateText)) return /xss|client-side/.test(label + vrt);
+  if (/(idor|bola|bfla|access|api|object|authz)/.test(candidateText)) return /access-control|object boundary|broken access/.test(label + vrt);
+  if (/(auth|session|oauth|account|login|reset)/.test(candidateText)) return /auth|session|account/.test(label + vrt);
+  if (/(ssrf|metadata|webhook|callback|url fetch)/.test(candidateText)) return /ssrf|cloud|metadata/.test(label + vrt);
+  if (/(file|path|xxe|deserial|upload|media)/.test(candidateText)) return /file|path|xxe|deserial|upload|media/.test(label + vrt);
+  if (/(csrf|clickjack|state)/.test(candidateText)) return /csrf|clickjacking|state/.test(label + vrt);
+  if (/(redirect|deeplink|deep-link|linking)/.test(candidateText)) return /redirect|deep-link|linking/.test(label + vrt);
+  if (/(cache|cors|header|static|secret|component)/.test(candidateText)) return /cache|cors|header|static|secret|component/.test(label + vrt);
+  if (/(mobile|android|ios|apk)/.test(candidateText)) return /mobile|app-link/.test(label + vrt);
+  if (/(business|logic|coupon|payment|tax|price)/.test(candidateText)) return /business|logic/.test(label + vrt);
+  return false;
+}
+
+function bountyLaneStats(state: RunState): Map<string, { total: number; active: number; recent: number }> {
+  const stats = new Map<string, { total: number; active: number; recent: number }>();
+  const advisorTasks = Object.values(state.tasks).filter((task) => task.source === "advisor");
+  const recentLabels = advisorTasks
+    .sort((left, right) => (left.startedAt ?? left.id).localeCompare(right.startedAt ?? right.id))
+    .slice(-6)
+    .map((task) => extractTaskLane(task))
+    .filter(Boolean) as string[];
+  for (const task of advisorTasks) {
+    const label = extractTaskLane(task);
+    if (!label) continue;
+    const current = stats.get(label) ?? { total: 0, active: 0, recent: 0 };
+    current.total += 1;
+    if (["queued", "starting", "running"].includes(task.status)) current.active += 1;
+    current.recent = recentLabels.filter((recent) => recent === label).length;
+    stats.set(label, current);
+  }
+  return stats;
+}
+
+function extractTaskLane(task: TaskState): string | undefined {
+  const match = task.prompt.match(/이번 작업 lane은\s+"([^"]+)"/);
+  return match?.[1];
+}
+
+function isHighImpactLane(lane: BountyLane): boolean {
+  const text = `${lane.label} ${lane.goal} ${(lane.vrt ?? []).join(" ")}`.toLowerCase();
+  return /(sqli|nosql|server-side injection|command|ssti|xss|ssrf|auth|account takeover|access-control|idor|bola|xxe|deserialization|path traversal|cloud|secret|business-logic)/.test(
+    text
+  );
+}
+
+function roleLaneOffset(role: string): number {
+  const value = role.toLowerCase();
+  if (value.includes("endpoint")) return 1;
+  if (value.includes("validator")) return 2;
+  if (value.includes("evidence")) return 3;
+  if (value.includes("report")) return 4;
+  return 0;
 }
 
 function ctfFallbackTask(runbook: Runbook, state: RunState, worker: AgentConfig): AdvisorDecision["next_tasks"][number] {
@@ -1267,6 +1457,7 @@ async function reapDeadWorkers(runDir: string): Promise<void> {
       if (agent) {
         agent.status = "failed";
         agent.pid = undefined;
+        agent.currentTaskId = undefined;
         agent.lastMessage = `worker pid=${entry.pid ?? "?"} reaped by coordinator`;
         agent.lastUpdate = nowIso();
       }

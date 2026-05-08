@@ -53,6 +53,7 @@ export interface ProgramConfig {
 export interface BountyLane {
   label: string;
   goal: string;
+  vrt?: string[];
   recon: string;
   validator: string;
   report: string;

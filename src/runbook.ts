@@ -71,6 +71,7 @@ const ProgramSchema = z
 const BountyLaneSchema = z.object({
   label: z.string().min(1),
   goal: z.string().min(1),
+  vrt: z.array(z.string()).default([]),
   recon: z.string().min(1),
   validator: z.string().min(1),
   report: z.string().min(1)
